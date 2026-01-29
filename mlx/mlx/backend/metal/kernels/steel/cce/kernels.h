@@ -1682,13 +1682,14 @@ template <typename T>
 }
 
 // =============================================================================
-// CCE Chunk LogSumExp Kernel (Parallel Version)
+// CCE Chunk LogSumExp Kernel (Single-Pass Online Algorithm)
 // Updates running max, sum_exp, and target_logit for online logsumexp
-// Uses SIMD reduction for parallel max/sum computation
+// Uses single-pass online algorithm (2x less memory bandwidth vs two-pass)
+// Coalesced memory access pattern with N_READS=4 vectorization
 // One threadgroup per row, threads cooperate on reduction
 // =============================================================================
 
-template <typename T>
+template <typename T, int N_READS = 4>
 [[kernel]] void cce_chunk_logsumexp(
     const device T* logits [[buffer(0)]],       // [N, chunk_V]
     const device int32_t* targets [[buffer(1)]],// [N]
@@ -1719,81 +1720,106 @@ template <typename T>
   threadgroup float* smem_max = smem;                    // [NUM_SIMDGROUPS]
   threadgroup float* smem_sum = smem + NUM_SIMDGROUPS;   // [NUM_SIMDGROUPS]
 
-  // Each thread handles multiple elements
   const int valid_chunk_v = min(chunk_V, V - v_start);
-  const int elements_per_thread = (valid_chunk_v + THREADS_PER_TG - 1) / THREADS_PER_TG;
+  const int iterations = (valid_chunk_v + THREADS_PER_TG * N_READS - 1) / (THREADS_PER_TG * N_READS);
 
-  // Phase 1: Each thread finds local max and accumulates target logit
-  float local_max = -INFINITY;
+  // Single-pass online algorithm: compute max and normalizer together
+  // This halves memory bandwidth compared to two-pass approach
+  float prevmax;
+  float maxval = -INFINITY;
+  float normalizer = 0.0f;
   float local_target = 0.0f;
   bool found_target = false;
 
-  for (int i = 0; i < elements_per_thread; i++) {
-    int v = lid + i * THREADS_PER_TG;
-    if (v < valid_chunk_v) {
-      float logit = float(row_logits[v]);
-      local_max = max(local_max, logit);
+  for (int r = 0; r < iterations; r++) {
+    // Coalesced memory access: consecutive threads read consecutive elements
+    int offset = r * THREADS_PER_TG * N_READS + lid * N_READS;
+    float vals[N_READS];
 
-      // Check if this is the target
-      int global_v = v_start + v;
-      if (global_v == target) {
-        local_target = logit;
+    // Load N_READS elements with coalesced access
+    if (offset + N_READS <= valid_chunk_v) {
+      #pragma unroll
+      for (int i = 0; i < N_READS; i++) {
+        vals[i] = float(row_logits[offset + i]);
+      }
+    } else {
+      #pragma unroll
+      for (int i = 0; i < N_READS; i++) {
+        vals[i] = (offset + i < valid_chunk_v) ? float(row_logits[offset + i]) : -INFINITY;
+      }
+    }
+
+    // Check for target in this batch
+    #pragma unroll
+    for (int i = 0; i < N_READS; i++) {
+      int global_v = v_start + offset + i;
+      if (global_v == target && offset + i < valid_chunk_v) {
+        local_target = vals[i];
         found_target = true;
       }
+    }
+
+    // Online logsumexp: update max and rescale normalizer
+    prevmax = maxval;
+    #pragma unroll
+    for (int i = 0; i < N_READS; i++) {
+      maxval = (maxval < vals[i]) ? vals[i] : maxval;
+    }
+
+    // Rescale existing normalizer to new max
+    normalizer *= fast::exp(prevmax - maxval);
+
+    // Add new values with scaling
+    #pragma unroll
+    for (int i = 0; i < N_READS; i++) {
+      normalizer += fast::exp(vals[i] - maxval);
     }
   }
 
   // SIMD reduction for max
-  float simd_max_val = simd_max(local_max);
+  prevmax = maxval;
+  maxval = simd_max(maxval);
+  // Rescale normalizer after SIMD max reduction
+  normalizer *= fast::exp(prevmax - maxval);
+  normalizer = simd_sum(normalizer);
 
-  // First thread in each simdgroup writes to shared memory
+  // Cross-simdgroup reduction
+  prevmax = maxval;
   if (simd_lid == 0) {
-    smem_max[simd_gid] = simd_max_val;
+    smem_max[simd_gid] = maxval;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Thread 0 reduces across simdgroups
-  float chunk_max = -INFINITY;
-  if (lid == 0) {
-    for (int i = 0; i < NUM_SIMDGROUPS; i++) {
-      chunk_max = max(chunk_max, smem_max[i]);
-    }
-    smem_max[0] = chunk_max;
+  // Each thread reads all simdgroup maxes for final max
+  maxval = simd_max(smem_max[simd_lid < NUM_SIMDGROUPS ? simd_lid : 0]);
+  // Limit to valid simdgroups
+  if (simd_lid >= NUM_SIMDGROUPS) {
+    maxval = smem_max[0];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  chunk_max = smem_max[0];
+  float chunk_max = maxval;
 
-  // Phase 2: Compute sum_exp using the chunk max
-  float local_sum_exp = 0.0f;
-  for (int i = 0; i < elements_per_thread; i++) {
-    int v = lid + i * THREADS_PER_TG;
-    if (v < valid_chunk_v) {
-      float logit = float(row_logits[v]);
-      local_sum_exp += exp(logit - chunk_max);
-    }
-  }
-
-  // SIMD reduction for sum
-  float simd_sum_val = simd_sum(local_sum_exp);
-
+  // Rescale and reduce normalizer across simdgroups
+  normalizer *= fast::exp(prevmax - chunk_max);
   if (simd_lid == 0) {
-    smem_sum[simd_gid] = simd_sum_val;
+    smem_sum[simd_gid] = normalizer;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Thread 0 reduces and updates running values
-  if (lid == 0) {
-    float chunk_sum_exp = 0.0f;
-    for (int i = 0; i < NUM_SIMDGROUPS; i++) {
-      chunk_sum_exp += smem_sum[i];
-    }
+  float chunk_sum_exp = 0.0f;
+  if (simd_lid < NUM_SIMDGROUPS) {
+    chunk_sum_exp = smem_sum[simd_lid];
+  }
+  chunk_sum_exp = simd_sum(chunk_sum_exp);
 
+  // Thread 0 updates running values
+  if (lid == 0) {
     // Online combination with running values
     float old_max = running_max[row];
     float old_sum_exp = running_sum_exp[row];
 
     float new_max = max(old_max, chunk_max);
-    float new_sum_exp = old_sum_exp * exp(old_max - new_max) + chunk_sum_exp * exp(chunk_max - new_max);
+    float new_sum_exp = old_sum_exp * fast::exp(old_max - new_max) +
+                        chunk_sum_exp * fast::exp(chunk_max - new_max);
 
     running_max[row] = new_max;
     running_sum_exp[row] = new_sum_exp;

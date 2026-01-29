@@ -48,6 +48,11 @@ lengths = mx.array([[0, len(tokens)-1]] * args.batch_size, dtype=mx.int32)
 opt = optim.Adam(learning_rate=1e-4)
 lvg = nn.value_and_grad(model, default_loss)
 
+# Check initial loss (before any training)
+(init_l, _), _ = lvg(model, batch, lengths)
+mx.eval(init_l)
+print(f"Initial loss: {init_l.item()}")
+
 # Warmup
 print(f"Warmup...")
 for _ in range(args.warmup):
@@ -74,3 +79,4 @@ print()
 print(f"RESULTS:")
 print(f"  Time/iter: {total_time/args.iters*1000:.1f} ms")
 print(f"  Peak mem:  {mx.get_peak_memory()/1e9:.3f} GB")
+print(f"  Final loss: {l.item()}")

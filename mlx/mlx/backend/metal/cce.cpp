@@ -31,11 +31,7 @@ constexpr int BLOCK_V = 128;  // Vocab entries per tile
 constexpr int BLOCK_D = 32;   // Hidden dimension tile
 constexpr int TILED_THREADS = 128;
 
-// MMA-optimized kernel constants (simdgroup_matrix 8x8 fragments)
-constexpr int MMA_BLOCK_B = 32;   // Must be multiple of 8
-constexpr int MMA_BLOCK_V = 64;   // Must be multiple of 8
-constexpr int MMA_BLOCK_D = 32;   // Must be multiple of 8
-constexpr int MMA_THREADS = 128;
+// Note: MMA constants removed - custom MMA kernel is slower than steel_matmul chunked approach
 
 // Chunked backward constants
 // Fixed chunk size - dynamic sizing caused regressions
@@ -109,13 +105,10 @@ void CCELoss::eval_gpu(
 
   auto& compute_encoder = d.get_command_encoder(s.index);
 
-  // Use chunked forward with steel_matmul for best performance
+  // Use chunked forward with steel_matmul for large vocab (best performance)
   // This computes logits in chunks and reduces to logsumexp
+  // For small problems, fall back to simple SIMD kernel
   bool use_chunked_forward = (V > 2000 && N >= 8);
-
-  // Fallback to MMA for smaller problems or when chunked is disabled
-  bool use_2d_tiled = !use_chunked_forward && (V > 2000 && N >= 8);
-  bool use_mma = use_2d_tiled && (H % 8 == 0);
 
   if (use_chunked_forward) {
     // Chunked forward: use steel_matmul + reduction for speed
@@ -253,133 +246,6 @@ void CCELoss::eval_gpu(
     d.add_temporary(running_max, s.index);
     d.add_temporary(running_sum_exp, s.index);
     d.add_temporary(target_logit, s.index);
-    d.add_temporary(std::move(neg_inf_val), s.index);
-    d.add_temporary(std::move(zero_val), s.index);
-
-  } else if (use_mma) {
-    // MMA-optimized forward kernel using simdgroup_matrix
-    array lse_out({N}, float32, nullptr, {});
-    lse_out.set_data(allocator::malloc(lse_out.nbytes()));
-
-    array neg_target_logit({N}, float32, nullptr, {});
-    neg_target_logit.set_data(allocator::malloc(neg_target_logit.nbytes()));
-
-    // Initialize: LSE = -inf, neg_target_logit = 0
-    array neg_inf_val = array(-std::numeric_limits<float>::infinity(), float32);
-    array zero_val = array(0.0f, float32);
-    fill_gpu(neg_inf_val, lse_out, s);
-    fill_gpu(zero_val, neg_target_logit, s);
-
-    std::string kernel_name = "cce_forward_mma_" + type_to_name(h.dtype()) +
-                              "_bb" + std::to_string(MMA_BLOCK_B) +
-                              "_bv" + std::to_string(MMA_BLOCK_V) +
-                              "_bd" + std::to_string(MMA_BLOCK_D);
-
-    auto kernel = d.get_kernel(kernel_name);
-    compute_encoder.set_compute_pipeline_state(kernel);
-
-    compute_encoder.set_input_array(h, 0);
-    compute_encoder.set_input_array(w, 1);
-    compute_encoder.set_input_array(t, 2);
-    compute_encoder.set_output_array(lse_out, 3);
-    compute_encoder.set_output_array(neg_target_logit, 4);
-    compute_encoder.set_bytes(params, 5);
-
-    // Threadgroup memory: H_smem + W_smem + logits_smem
-    // Note: MMA uses BLOCK_D * BLOCK_V instead of BLOCK_V * BLOCK_D for W
-    size_t smem_size = (MMA_BLOCK_B * MMA_BLOCK_D + MMA_BLOCK_D * MMA_BLOCK_V + MMA_BLOCK_B * MMA_BLOCK_V) * sizeof(float);
-    compute_encoder.set_threadgroup_memory_length(smem_size, 0);
-
-    // 2D grid: (B_tiles, V_tiles)
-    int b_tiles = (N + MMA_BLOCK_B - 1) / MMA_BLOCK_B;
-    int v_tiles = (V + MMA_BLOCK_V - 1) / MMA_BLOCK_V;
-    MTL::Size grid_dims = MTL::Size(b_tiles, v_tiles, 1);
-    MTL::Size group_dims = MTL::Size(MMA_THREADS, 1, 1);
-    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-
-    // Compute final loss: loss = (lse + neg_target_logit) * scale
-    {
-      auto combine_kernel = d.get_kernel("cce_combine_loss");
-      compute_encoder.set_compute_pipeline_state(combine_kernel);
-
-      compute_encoder.set_input_array(lse_out, 0);
-      compute_encoder.set_input_array(neg_target_logit, 1);
-      compute_encoder.set_output_array(loss, 2);
-      compute_encoder.set_bytes(params, 3);
-
-      int num_tgs = (N + 255) / 256;
-      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
-      MTL::Size group_dims = MTL::Size(256, 1, 1);
-      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-    }
-
-    d.add_temporary(lse_out, s.index);
-    d.add_temporary(neg_target_logit, s.index);
-    d.add_temporary(std::move(neg_inf_val), s.index);
-    d.add_temporary(std::move(zero_val), s.index);
-
-  } else if (use_2d_tiled) {
-    // Allocate LSE (initialized to -inf)
-    array lse_out({N}, float32, nullptr, {});
-    lse_out.set_data(allocator::malloc(lse_out.nbytes()));
-
-    // Allocate neg_target_logit (initialized to 0)
-    array neg_target_logit({N}, float32, nullptr, {});
-    neg_target_logit.set_data(allocator::malloc(neg_target_logit.nbytes()));
-
-    // Initialize: LSE = -inf, neg_target_logit = 0
-    array neg_inf_val = array(-std::numeric_limits<float>::infinity(), float32);
-    array zero_val = array(0.0f, float32);
-    fill_gpu(neg_inf_val, lse_out, s);
-    fill_gpu(zero_val, neg_target_logit, s);
-
-    // 2D tiled forward kernel (lock-free using atomic CAS)
-    std::string kernel_name = "cce_forward_2d_" + type_to_name(h.dtype()) +
-                              "_bb" + std::to_string(BLOCK_B) +
-                              "_bv" + std::to_string(BLOCK_V) +
-                              "_bd" + std::to_string(BLOCK_D);
-
-    auto kernel = d.get_kernel(kernel_name);
-    compute_encoder.set_compute_pipeline_state(kernel);
-
-    compute_encoder.set_input_array(h, 0);
-    compute_encoder.set_input_array(w, 1);
-    compute_encoder.set_input_array(t, 2);
-    compute_encoder.set_output_array(lse_out, 3);
-    compute_encoder.set_output_array(neg_target_logit, 4);
-    compute_encoder.set_bytes(params, 5);
-
-    // Threadgroup memory: H_smem + W_smem + logits_smem
-    size_t smem_size = (BLOCK_B * BLOCK_D + BLOCK_V * BLOCK_D + BLOCK_B * BLOCK_V) * sizeof(float);
-    compute_encoder.set_threadgroup_memory_length(smem_size, 0);
-
-    // 2D grid: (B_tiles, V_tiles)
-    int b_tiles = (N + BLOCK_B - 1) / BLOCK_B;
-    int v_tiles = (V + BLOCK_V - 1) / BLOCK_V;
-    MTL::Size grid_dims = MTL::Size(b_tiles, v_tiles, 1);
-    MTL::Size group_dims = MTL::Size(TILED_THREADS, 1, 1);
-    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-
-    // Compute final loss: loss = (lse + neg_target_logit) * scale
-    // (neg_target_logit stores -target_logit, so loss = lse - target_logit)
-    {
-      auto combine_kernel = d.get_kernel("cce_combine_loss");
-      compute_encoder.set_compute_pipeline_state(combine_kernel);
-
-      compute_encoder.set_input_array(lse_out, 0);
-      compute_encoder.set_input_array(neg_target_logit, 1);
-      compute_encoder.set_output_array(loss, 2);
-      compute_encoder.set_bytes(params, 3);
-
-      int num_tgs = (N + 255) / 256;
-      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
-      MTL::Size group_dims = MTL::Size(256, 1, 1);
-      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-    }
-
-    // Add temporaries
-    d.add_temporary(lse_out, s.index);
-    d.add_temporary(neg_target_logit, s.index);
     d.add_temporary(std::move(neg_inf_val), s.index);
     d.add_temporary(std::move(zero_val), s.index);
 

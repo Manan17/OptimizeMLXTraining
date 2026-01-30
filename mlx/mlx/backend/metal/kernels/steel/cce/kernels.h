@@ -120,56 +120,8 @@ template <typename T, int VOCAB_TILE = 512, int HIDDEN_TILE = 64>
   // Online softmax state
   OnlineSoftmax softmax_state;
   float target_logit = 0.0f;
-  bool found_target = false;
 
-  // Shared memory layout:
-  // Weight tile: [VOCAB_TILE, HIDDEN_TILE] but we load in chunks
-  threadgroup T* W_tile = shared_mem;
-
-  // Number of vocabulary tiles
-  const int num_vocab_tiles = (V + VOCAB_TILE - 1) / VOCAB_TILE;
-  // Number of hidden tiles per vocabulary tile
-  const int num_hidden_tiles = (H + HIDDEN_TILE - 1) / HIDDEN_TILE;
-
-  // Process vocabulary in tiles
-  for (int vt = 0; vt < num_vocab_tiles; vt++) {
-    const int v_start = vt * VOCAB_TILE;
-    const int v_end = min(v_start + VOCAB_TILE, V);
-    const int tile_v_size = v_end - v_start;
-
-    // For each vocab entry in this tile, compute logit by tiling over H
-    for (int local_v = simd_gid; local_v < tile_v_size; local_v += TOKENS_PER_TG) {
-      const int global_v = v_start + local_v;
-      if (global_v >= V) continue;
-
-      // Compute dot product: hidden[token] @ weight[global_v]
-      float partial_dot = 0.0f;
-
-      // Each thread computes its portion of the dot product
-      for (int i = 0; i < h_per_thread && h_start + i < H; i++) {
-        partial_dot += h_local[i] * float(weight[global_v * H + h_start + i]);
-      }
-
-      // Reduce across simdgroup to get full dot product
-      float logit = simd_sum(partial_dot);
-
-      // All threads in simdgroup have the same logit value now
-      // Update online softmax (only need one thread but all compute same value)
-      softmax_state.update(logit);
-
-      // Track target logit
-      if (global_v == target) {
-        target_logit = logit;
-        found_target = true;
-      }
-    }
-  }
-
-  // Alternative: process ALL vocab items for this token (simpler but same pattern)
-  // Reset and use simpler loop
-  softmax_state = OnlineSoftmax();
-  target_logit = 0.0f;
-
+  // Process all vocabulary items for this token
   for (int v = 0; v < V; v++) {
     // Compute partial dot product
     float partial_dot = 0.0f;
@@ -1636,12 +1588,15 @@ template <typename T, int BLOCK_B = 32, int BLOCK_V = 64, int BLOCK_D = 32>
 // =============================================================================
 // CCE Compute d_logits Kernel (for chunked backward)
 // Computes d_logits = (softmax - one_hot) * grad_output for a vocab chunk
-// OPTIMIZED: Uses 1D thread indexing for better thread utilization
+// OPTIMIZED:
+// - Vectorized: N_READS elements per thread (4x fewer threads, better coalescing)
+// - Branchless target subtraction (no warp divergence)
+// - Cached row-level values (lse, target, grad read once per thread batch)
 // =============================================================================
 
 // Native dtype version: reads T, computes in FP32, outputs T
 // Follows MLX pattern: BF16 in registers → FP32 compute → BF16 out
-template <typename T>
+template <typename T, int N_READS = 4>
 [[kernel]] void cce_compute_d_logits(
     const device T* logits [[buffer(0)]],            // [N, chunk_V]
     const device float* lse [[buffer(1)]],           // [N]
@@ -1655,37 +1610,54 @@ template <typename T>
     constant float& scale [[buffer(9)]],
     uint tid [[thread_position_in_grid]]) {
 
-  // 1D to 2D index conversion
+  // Each thread processes N_READS consecutive elements
+  const int base_idx = tid * N_READS;
   const int total_elements = N * chunk_V;
-  if (tid >= uint(total_elements)) return;
 
-  const int row = tid / chunk_V;
-  const int col = tid % chunk_V;
+  // Early exit if completely out of bounds
+  if (base_idx >= total_elements) return;
 
-  const int global_v = v_start + col;
-  if (global_v >= V) {
-    d_logits[tid] = T(0.0f);
-    return;
+  // Determine row for this batch of elements
+  // All N_READS elements are in the same row (consecutive in vocab dimension)
+  const int row = base_idx / chunk_V;
+  const int base_col = base_idx % chunk_V;
+
+  // Cache row-level values (read once, use N_READS times)
+  const float token_lse = lse[row];
+  const int target = targets[row];
+  const float grad_scale = grad_output[row] * scale;
+
+  // Process N_READS elements
+  #pragma unroll
+  for (int i = 0; i < N_READS; i++) {
+    const int idx = base_idx + i;
+    const int col = base_col + i;
+    const int global_v = v_start + col;
+
+    // Bounds check
+    if (idx >= total_elements || global_v >= V) {
+      if (idx < total_elements) {
+        d_logits[idx] = T(0.0f);
+      }
+      continue;
+    }
+
+    // Read logit in native dtype, convert to FP32
+    float logit = float(logits[idx]);
+
+    // Compute softmax probability
+    float prob = safe_exp(logit - token_lse);
+    prob = clamp(prob, 0.0f, 1.0f);
+
+    // Branchless: subtract 1.0 if this is the target (no warp divergence)
+    float d_logit = prob - float(global_v == target);
+
+    // Scale by upstream gradient
+    d_logit *= grad_scale;
+
+    // Convert back to native dtype and write
+    d_logits[idx] = T(d_logit);
   }
-
-  // Read in native dtype, convert to FP32 in register (MLX pattern)
-  float logit = float(logits[tid]);
-  float token_lse = lse[row];
-
-  // All computation in FP32 (in registers)
-  float prob = safe_exp(logit - token_lse);
-  prob = clamp(prob, 0.0f, 1.0f);
-
-  float d_logit = prob;
-  int target = targets[row];
-  if (global_v == target) {
-    d_logit -= 1.0f;
-  }
-
-  d_logit *= grad_output[row] * scale;
-
-  // Convert back to native dtype and write (MLX pattern)
-  d_logits[tid] = T(d_logit);
 }
 
 // =============================================================================
@@ -1743,13 +1715,25 @@ template <typename T, int N_READS = 4>
     int offset = r * THREADS_PER_TG * N_READS + lid * N_READS;
     float vals[N_READS];
 
-    // Load N_READS elements with coalesced access
+    // Load N_READS elements with vectorized access when possible
+    // float4/half4 loads are more efficient than scalar loops
     if (offset + N_READS <= valid_chunk_v) {
-      #pragma unroll
-      for (int i = 0; i < N_READS; i++) {
-        vals[i] = float(row_logits[offset + i]);
+      // Vectorized load path - use packed vector loads for better memory throughput
+      if constexpr (N_READS == 4) {
+        // Cast to vec4 pointer for single wide load instruction
+        vec<T, 4> packed = *reinterpret_cast<const device vec<T, 4>*>(row_logits + offset);
+        vals[0] = float(packed[0]);
+        vals[1] = float(packed[1]);
+        vals[2] = float(packed[2]);
+        vals[3] = float(packed[3]);
+      } else {
+        #pragma unroll
+        for (int i = 0; i < N_READS; i++) {
+          vals[i] = float(row_logits[offset + i]);
+        }
       }
     } else {
+      // Scalar fallback for boundary conditions
       #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         vals[i] = (offset + i < valid_chunk_v) ? float(row_logits[offset + i]) : -INFINITY;
@@ -1836,20 +1820,37 @@ template <typename T, int N_READS = 4>
   float simd_target_val = simd_sum(local_target);
 
   // Use reduction for found_target
+  // Store both the value and a found flag to handle target_logit == 0.0 correctly
+  // Reuse smem_sum (no longer needed) for found flags
   bool any_found = simd_any(found_target);
   if (simd_lid == 0) {
-    smem_max[simd_gid] = any_found ? simd_target_val : 0.0f;
+    smem_max[simd_gid] = simd_target_val;           // Always store the value
+    smem_sum[simd_gid] = any_found ? 1.0f : 0.0f;   // Store found flag
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (lid == 0) {
     for (int i = 0; i < NUM_SIMDGROUPS; i++) {
-      if (smem_max[i] != 0.0f) {
+      if (smem_sum[i] != 0.0f) {  // Check found flag, not value
         target_logit[row] = smem_max[i];
         break;
       }
     }
   }
+}
+
+// =============================================================================
+// CCE Finalize Helper (Unified Logic)
+// Common computation for finalize kernels - reduces code duplication
+// =============================================================================
+
+METAL_FUNC float cce_compute_lse(float running_max_val, float running_sum_exp_val) {
+  // Add epsilon for numerical stability (consistent with other logsumexp computations)
+  return running_max_val + log(running_sum_exp_val + 1e-9f);
+}
+
+METAL_FUNC float cce_compute_loss(float lse, float target_logit_val, float scale) {
+  return (lse - target_logit_val) * scale;
 }
 
 // =============================================================================
@@ -1867,14 +1868,33 @@ template <typename T, int N_READS = 4>
     uint tid [[thread_position_in_grid]]) {
 
   if (tid >= uint(N)) return;
+  logsumexp[tid] = cce_compute_lse(running_max[tid], running_sum_exp[tid]);
+}
 
-  logsumexp[tid] = running_max[tid] + log(running_sum_exp[tid]);
+// =============================================================================
+// CCE Init Running Values Kernel
+// Initializes running_max=-inf, running_sum_exp=0, target_logit=0 in one dispatch
+// Reduces 3 separate fill operations to 1 kernel launch
+// =============================================================================
+
+[[host_name("cce_init_running_values")]]
+[[kernel]] void cce_init_running_values(
+    device float* running_max [[buffer(0)]],
+    device float* running_sum_exp [[buffer(1)]],
+    device float* target_logit [[buffer(2)]],
+    constant int& N [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]) {
+
+  if (tid >= uint(N)) return;
+
+  running_max[tid] = -INFINITY;
+  running_sum_exp[tid] = 0.0f;
+  target_logit[tid] = 0.0f;
 }
 
 // =============================================================================
 // CCE Finalize Loss Kernel
 // Computes final loss from running max, sum_exp, and target_logit
-// loss = (max + log(sum_exp) - target_logit) * scale
 // =============================================================================
 
 [[host_name("cce_finalize_loss")]]
@@ -1892,22 +1912,18 @@ template <typename T, int N_READS = 4>
   if (tid >= uint(N)) return;
 
   int target = targets[tid];
-
   if (target == ignore_index) {
     loss[tid] = 0.0f;
     return;
   }
 
-  // loss = (max + log(sum_exp) - target_logit) * scale = (logsumexp - target_logit) * scale
-  float lse = running_max[tid] + log(running_sum_exp[tid]);
-  loss[tid] = (lse - target_logit[tid]) * scale;
+  float lse = cce_compute_lse(running_max[tid], running_sum_exp[tid]);
+  loss[tid] = cce_compute_loss(lse, target_logit[tid], scale);
 }
 
 // =============================================================================
 // CCE Finalize Loss With LSE Kernel
-// Computes final loss AND outputs logsumexp for backward pass (memory optimization)
-// loss = (max + log(sum_exp) - target_logit) * scale
-// logsumexp_out = max + log(sum_exp)
+// Computes final loss AND outputs logsumexp for backward pass
 // =============================================================================
 
 [[host_name("cce_finalize_loss_with_lse")]]
@@ -1925,21 +1941,16 @@ template <typename T, int N_READS = 4>
 
   if (tid >= uint(N)) return;
 
+  float lse = cce_compute_lse(running_max[tid], running_sum_exp[tid]);
+  logsumexp_out[tid] = lse;  // Always output for backward pass
+
   int target = targets[tid];
-
-  // Compute logsumexp
-  float lse = running_max[tid] + log(running_sum_exp[tid]);
-
-  // Always output logsumexp (needed for backward)
-  logsumexp_out[tid] = lse;
-
   if (target == ignore_index) {
     loss[tid] = 0.0f;
     return;
   }
 
-  // loss = (logsumexp - target_logit) * scale
-  loss[tid] = (lse - target_logit[tid]) * scale;
+  loss[tid] = cce_compute_loss(lse, target_logit[tid], scale);
 }
 
 // =============================================================================

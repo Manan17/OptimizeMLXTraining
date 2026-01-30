@@ -155,22 +155,37 @@ void CCELoss::eval_gpu(
     array logits_chunk({N, max_chunk_v}, logits_dtype, nullptr, {});
     logits_chunk.set_data(allocator::malloc(logits_chunk.nbytes()));
 
-    // Allocate running max and sum_exp for online logsumexp
+    // Allocate consolidated buffer for running state (saves 2 allocation calls)
+    // Layout: [running_max (N) | running_sum_exp (N) | target_logit (N)]
+    array running_state({3 * N}, float32, nullptr, {});
+    running_state.set_data(allocator::malloc(running_state.nbytes()));
+
+    // Create views into the consolidated buffer
     array running_max({N}, float32, nullptr, {});
-    running_max.set_data(allocator::malloc(running_max.nbytes()));
+    running_max.copy_shared_buffer(running_state, {1}, running_state.flags(), N, 0);
+
     array running_sum_exp({N}, float32, nullptr, {});
-    running_sum_exp.set_data(allocator::malloc(running_sum_exp.nbytes()));
+    running_sum_exp.copy_shared_buffer(running_state, {1}, running_state.flags(), N, N);
 
-    // Allocate target logit accumulator
     array target_logit({N}, float32, nullptr, {});
-    target_logit.set_data(allocator::malloc(target_logit.nbytes()));
+    target_logit.copy_shared_buffer(running_state, {1}, running_state.flags(), N, 2 * N);
 
-    // Initialize: max = -inf, sum_exp = 0, target_logit = 0
-    array neg_inf_val = array(-std::numeric_limits<float>::infinity(), float32);
-    array zero_val = array(0.0f, float32);
-    fill_gpu(neg_inf_val, running_max, s);
-    fill_gpu(zero_val, running_sum_exp, s);
-    fill_gpu(zero_val, target_logit, s);
+    // Initialize all running values in single kernel dispatch (reduces 3 dispatches to 1)
+    // running_max = -inf, running_sum_exp = 0, target_logit = 0
+    {
+      auto init_kernel = d.get_kernel("cce_init_running_values");
+      compute_encoder.set_compute_pipeline_state(init_kernel);
+      compute_encoder.set_output_array(running_max, 0);
+      compute_encoder.set_output_array(running_sum_exp, 1);
+      compute_encoder.set_output_array(target_logit, 2);
+      compute_encoder.set_bytes(N, 3);
+
+      int threads_per_tg = 256;
+      int num_tgs = (N + threads_per_tg - 1) / threads_per_tg;
+      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+      MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    }
 
     // Cache kernel
     std::string lse_kernel_name = "cce_chunk_logsumexp_" + type_to_name(h.dtype());
@@ -273,11 +288,7 @@ void CCELoss::eval_gpu(
     }
 
     d.add_temporary(logits_chunk, s.index);
-    d.add_temporary(running_max, s.index);
-    d.add_temporary(running_sum_exp, s.index);
-    d.add_temporary(target_logit, s.index);
-    d.add_temporary(std::move(neg_inf_val), s.index);
-    d.add_temporary(std::move(zero_val), s.index);
+    d.add_temporary(running_state, s.index);  // Consolidated buffer (views share this)
 
   } else {
     // Simple SIMD kernel for smaller problems
@@ -429,10 +440,16 @@ void CCELossVJP::eval_gpu(
       // Recompute logsumexp (fallback path)
       logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
 
+      // Allocate consolidated buffer for running state (saves 1 allocation call)
+      // Layout: [running_max (N) | running_sum_exp (N)]
+      array running_state_bwd({2 * N}, float32, nullptr, {});
+      running_state_bwd.set_data(allocator::malloc(running_state_bwd.nbytes()));
+
       array running_max({N}, float32, nullptr, {});
-      running_max.set_data(allocator::malloc(running_max.nbytes()));
+      running_max.copy_shared_buffer(running_state_bwd, {1}, running_state_bwd.flags(), N, 0);
+
       array running_sum_exp({N}, float32, nullptr, {});
-      running_sum_exp.set_data(allocator::malloc(running_sum_exp.nbytes()));
+      running_sum_exp.copy_shared_buffer(running_state_bwd, {1}, running_state_bwd.flags(), N, N);
       // Note: We reuse logsumexp as dummy target output (kernel writes target_logit here,
       // but we don't need it - logsumexp is overwritten in finalize step anyway)
 
@@ -440,13 +457,22 @@ void CCELossVJP::eval_gpu(
       array lse_logits_chunk({N, max_chunk_v}, compute_dtype, nullptr, {});
       lse_logits_chunk.set_data(allocator::malloc(lse_logits_chunk.nbytes()));
 
-      // Initialize: max = -inf, sum_exp = 0
-      // Note: logsumexp is used as dummy target output (overwritten in finalize step)
-      array neg_inf_val = array(-std::numeric_limits<float>::infinity(), float32);
-      array zero_val_lse = array(0.0f, float32);
-      fill_gpu(neg_inf_val, running_max, s);
-      fill_gpu(zero_val_lse, running_sum_exp, s);
-      fill_gpu(zero_val_lse, logsumexp, s);  // Used as dummy target
+      // Initialize all running values in single kernel dispatch (reduces 3 dispatches to 1)
+      // running_max = -inf, running_sum_exp = 0, logsumexp = 0 (used as dummy target)
+      {
+        auto init_kernel = d.get_kernel("cce_init_running_values");
+        compute_encoder.set_compute_pipeline_state(init_kernel);
+        compute_encoder.set_output_array(running_max, 0);
+        compute_encoder.set_output_array(running_sum_exp, 1);
+        compute_encoder.set_output_array(logsumexp, 2);  // Used as dummy target output
+        compute_encoder.set_bytes(N, 3);
+
+        int threads_per_tg = 256;
+        int num_tgs = (N + threads_per_tg - 1) / threads_per_tg;
+        MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
+        MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
+        compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+      }
 
       // Cache kernel for logsumexp
       std::string lse_kernel_name = "cce_chunk_logsumexp_" + type_to_name(h.dtype());
@@ -521,11 +547,8 @@ void CCELossVJP::eval_gpu(
         compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
       }
 
-      d.add_temporary(running_max, s.index);
-      d.add_temporary(running_sum_exp, s.index);
+      d.add_temporary(running_state_bwd, s.index);  // Consolidated buffer (views share this)
       d.add_temporary(lse_logits_chunk, s.index);
-      d.add_temporary(std::move(neg_inf_val), s.index);
-      d.add_temporary(std::move(zero_val_lse), s.index);
     }
 
     // Chunked backward: process vocabulary in chunks using standard matmuls
@@ -587,10 +610,13 @@ void CCELossVJP::eval_gpu(
       compute_encoder.set_bytes(V, 8);
       compute_encoder.set_bytes(scale, 9);
 
-      // OPTIMIZATION 2: Use 1D dispatch with better thread utilization
+      // OPTIMIZATION: Vectorized kernel - each thread processes N_READS=4 elements
+      // This reduces dispatch overhead and improves memory coalescing
+      constexpr int N_READS = 4;
       int total_elements = N * current_chunk_v;
-      int threads_per_tg = 256;  // Optimal for most GPUs
-      int num_tgs = (total_elements + threads_per_tg - 1) / threads_per_tg;
+      int total_threads = (total_elements + N_READS - 1) / N_READS;
+      int threads_per_tg = 256;
+      int num_tgs = (total_threads + threads_per_tg - 1) / threads_per_tg;
       MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
       MTL::Size group_dims = MTL::Size(threads_per_tg, 1, 1);
       compute_encoder.dispatch_threadgroups(grid_dims, group_dims);

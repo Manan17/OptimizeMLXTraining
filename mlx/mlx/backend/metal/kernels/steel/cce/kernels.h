@@ -1823,6 +1823,11 @@ template <typename T, int N_READS = 4>
     running_sum_exp[row] = new_sum_exp;
   }
 
+  // CRITICAL: Barrier before reusing smem for target_logit
+  // Without this, thread 0's sequential read of smem_max[i] races with
+  // other threads writing to smem_max for target_logit computation
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
   // Accumulate target logit (use SIMD reduction)
   float simd_target_val = simd_sum(local_target);
 

@@ -215,7 +215,7 @@ instantiate_cce_backward_mma(bfloat16, bfloat16_t, 32, 64, 32)
       const device float* lse [[buffer(1)]],                                      \
       const device int32_t* targets [[buffer(2)]],                                \
       const device float* grad_output [[buffer(3)]],                              \
-      device float* d_logits [[buffer(4)]],                                       \
+      device type* d_logits [[buffer(4)]],                                        \
       constant int& N [[buffer(5)]],                                              \
       constant int& chunk_V [[buffer(6)]],                                        \
       constant int& v_start [[buffer(7)]],                                        \

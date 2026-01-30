@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Compare CCE vs baseline gradients directly"""
+"""Compare CCE vs baseline gradients directly - supports both BF16 and FP32"""
+import argparse
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load
@@ -10,19 +11,28 @@ def to_fp32(x):
         return x.astype(mx.float32)
     return x
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default="mlx-community/Qwen3-0.6B-bf16")
+parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
+parser.add_argument("--batch-size", type=int, default=32)
+parser.add_argument("--seq-length", type=int, default=128)
+args = parser.parse_args()
+
 # Load model
-model, tok = load('mlx-community/Qwen3-0.6B-bf16')
-model.update(tree_map(to_fp32, model.parameters()))
+model, tok = load(args.model)
+
+if args.dtype == "fp32":
+    model.update(tree_map(to_fp32, model.parameters()))
+
 mx.eval(model.parameters())
+print(f"Model dtype: {model.model.embed_tokens.weight.dtype}")
 
-# Create batch - use larger size to test chunked backward path
-batch_size = 32
-seq_length = 128
-tokens = tok.encode('Hello world. ' * 20)[:seq_length]
-batch = mx.array([tokens] * batch_size, dtype=mx.int32)
-lengths = mx.array([[0, len(tokens)-1]] * batch_size, dtype=mx.int32)
+# Create batch
+tokens = tok.encode('Hello world. ' * 20)[:args.seq_length]
+batch = mx.array([tokens] * args.batch_size, dtype=mx.int32)
+lengths = mx.array([[0, len(tokens)-1]] * args.batch_size, dtype=mx.int32)
 
-print(f"Batch: {batch_size} x {seq_length}")
+print(f"Batch: {args.batch_size} x {args.seq_length}")
 print(f"Vocab size: {model.model.embed_tokens.weight.shape[0]}")
 print()
 
@@ -76,9 +86,13 @@ total_diff_norm = 0.0
 total_baseline_norm = 0.0
 
 for (name, bg), (_, cg) in zip(baseline_flat, cce_flat):
-    bg_norm = mx.sqrt((bg ** 2).sum()).item()
-    cg_norm = mx.sqrt((cg ** 2).sum()).item()
-    diff = bg - cg
+    # Convert to FP32 for comparison if needed
+    bg_f32 = bg.astype(mx.float32) if bg.dtype != mx.float32 else bg
+    cg_f32 = cg.astype(mx.float32) if cg.dtype != mx.float32 else cg
+
+    bg_norm = mx.sqrt((bg_f32 ** 2).sum()).item()
+    cg_norm = mx.sqrt((cg_f32 ** 2).sum()).item()
+    diff = bg_f32 - cg_f32
     diff_norm = mx.sqrt((diff ** 2).sum()).item()
 
     total_diff_norm += diff_norm ** 2
@@ -94,3 +108,10 @@ print()
 print(f"Total gradient diff norm: {total_diff_norm:.6f}")
 print(f"Total baseline norm:      {total_baseline_norm:.6f}")
 print(f"Total relative error:     {total_diff_norm / total_baseline_norm:.6f}")
+
+# Check gradient dtypes
+print()
+print("Gradient dtypes:")
+for name, g in cce_flat[:3]:
+    print(f"  {name}: {g.dtype}")
+print("  ...")

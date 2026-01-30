@@ -1639,13 +1639,15 @@ template <typename T, int BLOCK_B = 32, int BLOCK_V = 64, int BLOCK_D = 32>
 // OPTIMIZED: Uses 1D thread indexing for better thread utilization
 // =============================================================================
 
+// Native dtype version: reads T, computes in FP32, outputs T
+// Follows MLX pattern: BF16 in registers → FP32 compute → BF16 out
 template <typename T>
 [[kernel]] void cce_compute_d_logits(
     const device T* logits [[buffer(0)]],            // [N, chunk_V]
     const device float* lse [[buffer(1)]],           // [N]
     const device int32_t* targets [[buffer(2)]],     // [N]
     const device float* grad_output [[buffer(3)]],   // [N]
-    device float* d_logits [[buffer(4)]],            // [N, chunk_V]
+    device T* d_logits [[buffer(4)]],                // [N, chunk_V] - same type as input
     constant int& N [[buffer(5)]],
     constant int& chunk_V [[buffer(6)]],
     constant int& v_start [[buffer(7)]],             // Start index in full vocab
@@ -1662,12 +1664,15 @@ template <typename T>
 
   const int global_v = v_start + col;
   if (global_v >= V) {
-    d_logits[tid] = 0.0f;
+    d_logits[tid] = T(0.0f);
     return;
   }
 
+  // Read in native dtype, convert to FP32 in register (MLX pattern)
   float logit = float(logits[tid]);
   float token_lse = lse[row];
+
+  // All computation in FP32 (in registers)
   float prob = safe_exp(logit - token_lse);
   prob = clamp(prob, 0.0f, 1.0f);
 
@@ -1678,7 +1683,9 @@ template <typename T>
   }
 
   d_logit *= grad_output[row] * scale;
-  d_logits[tid] = d_logit;
+
+  // Convert back to native dtype and write (MLX pattern)
+  d_logits[tid] = T(d_logit);
 }
 
 // =============================================================================

@@ -25,11 +25,6 @@ constexpr int SIMD_SIZE = 32;
 constexpr int ROWS_PER_TG = 4;
 constexpr int THREADS_PER_TG = SIMD_SIZE * ROWS_PER_TG;  // 128 threads
 
-// 2D tiled kernel constants (matching Apple's approach)
-constexpr int BLOCK_B = 32;   // Tokens per tile
-constexpr int BLOCK_V = 128;  // Vocab entries per tile
-constexpr int BLOCK_D = 32;   // Hidden dimension tile
-constexpr int TILED_THREADS = 128;
 
 // Note: MMA constants removed - custom MMA kernel is slower than steel_matmul chunked approach
 
@@ -350,13 +345,17 @@ void CCELossVJP::eval_gpu(
   const array& t = ensure_contiguous(targets_in);
   const array& g_out_raw = ensure_contiguous(grad_output);
 
-  // CCE backward requires FP32 inputs for numerical stability
-  if (h.dtype() != float32 || w.dtype() != float32) {
+  // NATIVE BF16 SUPPORT: Accept both FP32 and BF16 inputs
+  // Following MLX pattern: BF16 in registers → FP32 compute → BF16 out (no explicit casts)
+  bool use_bf16 = (h.dtype() == bfloat16 && w.dtype() == bfloat16);
+  bool use_fp32 = (h.dtype() == float32 && w.dtype() == float32);
+
+  if (!use_bf16 && !use_fp32) {
     throw std::invalid_argument(
-        "CCE backward requires float32 inputs. "
-        "For BF16 models, convert to FP32 before calling: "
-        "mx.fast.cce_loss(hidden.astype(mx.float32), weight.astype(mx.float32), targets)");
+        "CCE backward requires matching input dtypes. Supported: both float32 or both bfloat16.");
   }
+
+  Dtype compute_dtype = use_bf16 ? bfloat16 : float32;
 
   // Handle scalar grad_output (from mx.mean())
   array g_out_expanded({N}, float32, nullptr, {});
@@ -373,28 +372,30 @@ void CCELossVJP::eval_gpu(
   array& grad_hidden = outputs[0];
   array& grad_weight = outputs[1];
 
-  // Allocate outputs
+  // Allocate outputs (same dtype as inputs - BF16 or FP32)
   grad_hidden.set_data(allocator::malloc(grad_hidden.nbytes()));
   grad_weight.set_data(allocator::malloc(grad_weight.nbytes()));
 
-  // Since backward requires FP32 inputs, outputs are also FP32
-  // No dtype conversion needed - use outputs directly
-  array& grad_hidden_f32 = grad_hidden;
-  array& grad_weight_f32 = grad_weight;
-
   // Zero grad_weight (grad_hidden uses beta=0 for first chunk, so no zero needed)
-  array zero_val = array(0.0f, float32);
-  fill_gpu(zero_val, grad_weight, s);
+  // Use appropriate zero value for dtype
+  if (use_bf16) {
+    array zero_val_bf16 = array(static_cast<float>(0.0f), bfloat16);
+    fill_gpu(zero_val_bf16, grad_weight, s);
+    copies.push_back(std::move(zero_val_bf16));
+  } else {
+    array zero_val_f32 = array(0.0f, float32);
+    fill_gpu(zero_val_f32, grad_weight, s);
+    copies.push_back(std::move(zero_val_f32));
+  }
 
   float scale = 1.0f;
   mlx::steel::CCEParams params{N, H, V, ignore_index_, scale};
 
   auto& compute_encoder = d.get_command_encoder(s.index);
 
-  // Enable 2D tiled backward for larger problems
-  // OPTIMIZATION: Match forward pass threshold for consistency
-  bool use_2d_tiled = (V > 2000 && N >= 256);
-  bool use_mma = use_2d_tiled && (H % 8 == 0);
+  // Use chunked backward with steel_matmul for larger problems
+  // steel_matmul handles arbitrary dimensions (no H % 8 requirement)
+  bool use_mma = (V > 2000 && N >= 256);
 
   if (use_mma) {
     // Chunked backward using steel_matmul (avoids atomic contention)
@@ -435,8 +436,8 @@ void CCELossVJP::eval_gpu(
       // Note: We reuse logsumexp as dummy target output (kernel writes target_logit here,
       // but we don't need it - logsumexp is overwritten in finalize step anyway)
 
-      // Allocate reusable logits buffer for logsumexp computation
-      array lse_logits_chunk({N, max_chunk_v}, float32, nullptr, {});
+      // Allocate reusable logits buffer for logsumexp computation (native dtype)
+      array lse_logits_chunk({N, max_chunk_v}, compute_dtype, nullptr, {});
       lse_logits_chunk.set_data(allocator::malloc(lse_logits_chunk.nbytes()));
 
       // Initialize: max = -inf, sum_exp = 0
@@ -467,14 +468,14 @@ void CCELossVJP::eval_gpu(
         weight_chunk.copy_shared_buffer(
             w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
 
-        // Create view of logits_chunk
-        array logits_view({N, current_chunk_v}, float32, nullptr, {});
+        // Create view of logits_chunk (native dtype)
+        array logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
         logits_view.copy_shared_buffer(
             lse_logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, lse_logits_chunk.flags(),
             static_cast<size_t>(N * current_chunk_v), 0);
 
         // Compute logits_chunk = hidden @ weight_chunk.T
-        // NATIVE BF16: BF16 matmul produces BF16 logits, reduction kernel handles FP32 accumulation
+        // NATIVE BF16: BF16 matmul produces BF16 logits, kernel handles FP32 accumulation internally
         steel_matmul(
             s, d,
             h, weight_chunk, logits_view,
@@ -529,16 +530,14 @@ void CCELossVJP::eval_gpu(
 
     // Chunked backward: process vocabulary in chunks using standard matmuls
 
-    // Allocate FP32 logits buffer for in-place computation (logits -> d_logits)
-    array logits_chunk({N, max_chunk_v}, float32, nullptr, {});
+    // NATIVE BF16: Allocate logits buffer in native dtype (BF16 or FP32)
+    // Following MLX pattern: no explicit casts, all conversions in kernel registers
+    array logits_chunk({N, max_chunk_v}, compute_dtype, nullptr, {});
     logits_chunk.set_data(allocator::malloc(logits_chunk.nbytes()));
 
-    // Note: Chunked grad_weight was used for BF16 output, but backward now requires FP32
-
     // OPTIMIZATION: Cache kernel lookup outside loop
-    // NOTE: Always use FP32 kernel since logits_view and d_logits_view are FP32
-    // The input dtype only affects the Metal kernel for reading hidden/weight, not logits
-    std::string d_logits_kernel_name = "cce_compute_d_logits_float32";
+    // Use dtype-specific kernel (handles BF16→FP32→BF16 conversion in registers)
+    std::string d_logits_kernel_name = "cce_compute_d_logits_" + type_to_name(h.dtype());
     auto d_logits_kernel = d.get_kernel(d_logits_kernel_name);
 
     for (int chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
@@ -553,13 +552,14 @@ void CCELossVJP::eval_gpu(
       weight_chunk.copy_shared_buffer(
           w, {static_cast<int64_t>(H), 1}, w.flags(), static_cast<size_t>(current_chunk_v * H), w_offset);
 
-      // Create view of logits_chunk for actual chunk size (handles last chunk)
-      array logits_view({N, current_chunk_v}, float32, nullptr, {});
+      // Create view of logits_chunk for actual chunk size (native dtype)
+      array logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
       logits_view.copy_shared_buffer(
           logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
           static_cast<size_t>(N * current_chunk_v), 0);
 
       // Compute logits_chunk = hidden @ weight_chunk.T
+      // NATIVE BF16: steel_matmul handles FP32 accumulation internally
       steel_matmul(
           s, d,
           h, weight_chunk, logits_view,
@@ -569,8 +569,8 @@ void CCELossVJP::eval_gpu(
           false, true,    // transpose_a, transpose_b
           copies);
 
-      // Step 2: Compute d_logits (in-place over logits_view since both are FP32)
-      array d_logits_view({N, current_chunk_v}, float32, nullptr, {});
+      // Step 2: Compute d_logits (in-place, kernel does BF16→FP32→BF16 in registers)
+      array d_logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
       d_logits_view.copy_shared_buffer(
           logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
           static_cast<size_t>(N * current_chunk_v), 0);
@@ -580,7 +580,7 @@ void CCELossVJP::eval_gpu(
       compute_encoder.set_input_array(logsumexp, 1);
       compute_encoder.set_input_array(t, 2);
       compute_encoder.set_input_array(g_out, 3);
-      compute_encoder.set_output_array(d_logits_view, 4);  // FP32 output
+      compute_encoder.set_output_array(d_logits_view, 4);  // Native dtype output
       compute_encoder.set_bytes(N, 5);
       compute_encoder.set_bytes(current_chunk_v, 6);
       compute_encoder.set_bytes(v_start, 7);
@@ -596,13 +596,13 @@ void CCELossVJP::eval_gpu(
       compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
       // Step 3: Accumulate grad_hidden += d_logits @ weight_chunk
+      // NATIVE BF16: steel_matmul_axpby handles FP32 accumulation internally
       float alpha = 1.0f;
       float beta = (chunk_idx == 0) ? 0.0f : 1.0f;
 
-      // FP32 mode: d_logits @ weight → FP32 grad_hidden
       steel_matmul_axpby<true>(
           s, d,
-          d_logits_view, weight_chunk, grad_hidden_f32, grad_hidden_f32,
+          d_logits_view, weight_chunk, grad_hidden, grad_hidden,
           N, H, current_chunk_v,  // M, N, K
           1,              // batch_size
           current_chunk_v, H,     // lda, ldb
@@ -612,8 +612,8 @@ void CCELossVJP::eval_gpu(
           alpha, beta);
 
       // Step 4: Compute grad_weight_chunk = d_logits.T @ hidden
-      // Write directly to grad_weight (FP32 since backward requires FP32 inputs)
-      array grad_weight_chunk({current_chunk_v, H}, float32, nullptr, {});
+      // Write directly to grad_weight (native dtype)
+      array grad_weight_chunk({current_chunk_v, H}, compute_dtype, nullptr, {});
       int64_t gw_offset = static_cast<int64_t>(v_start) * H;
       grad_weight_chunk.copy_shared_buffer(
           grad_weight, {static_cast<int64_t>(H), 1}, grad_weight.flags(),
@@ -629,8 +629,7 @@ void CCELossVJP::eval_gpu(
           copies);
     }
 
-
-    // FP32 outputs written directly to grad_hidden/grad_weight, no conversion needed
+    // NATIVE BF16: Outputs written directly in native dtype, no conversion needed
 
     // Only add logsumexp as temporary if we allocated it
     if (logsumexp_needs_temp) {
@@ -638,68 +637,15 @@ void CCELossVJP::eval_gpu(
     }
     d.add_temporary(logits_chunk, s.index);
 
-  } else if (use_2d_tiled) {
-    // First compute LSE using SIMD forward kernel
-    array logsumexp({N}, float32, nullptr, {});
-    logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
-    array dummy_loss({N}, float32, nullptr, {});
-    dummy_loss.set_data(allocator::malloc(dummy_loss.nbytes()));
-
-    {
-      std::string kernel_name = "cce_simd_forward_" + type_to_name(h.dtype());
-      auto kernel = d.get_kernel(kernel_name);
-      compute_encoder.set_compute_pipeline_state(kernel);
-
-      compute_encoder.set_input_array(h, 0);
-      compute_encoder.set_input_array(w, 1);
-      compute_encoder.set_input_array(t, 2);
-      compute_encoder.set_output_array(dummy_loss, 3);
-      compute_encoder.set_output_array(logsumexp, 4);
-      compute_encoder.set_bytes(params, 5);
-
-      int num_tgs = (N + ROWS_PER_TG - 1) / ROWS_PER_TG;
-      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
-      MTL::Size group_dims = MTL::Size(THREADS_PER_TG, 1, 1);
-      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  } else {
+    // Legacy SIMD-based backward pass (only for small problems)
+    // Note: Legacy path only supports FP32 outputs
+    if (use_bf16) {
+      throw std::invalid_argument(
+          "CCE backward with BF16 requires larger problem size (V > 2000 && N >= 256). "
+          "For small problems, use FP32 inputs.");
     }
 
-    // 2D tiled backward kernel (lock-free, uses atomic adds)
-    std::string kernel_name = "cce_backward_2d_" + type_to_name(h.dtype()) +
-                              "_bb" + std::to_string(BLOCK_B) +
-                              "_bv" + std::to_string(BLOCK_V) +
-                              "_bd" + std::to_string(BLOCK_D);
-
-    auto kernel = d.get_kernel(kernel_name);
-    compute_encoder.set_compute_pipeline_state(kernel);
-
-    compute_encoder.set_input_array(h, 0);
-    compute_encoder.set_input_array(w, 1);
-    compute_encoder.set_input_array(t, 2);
-    compute_encoder.set_input_array(logsumexp, 3);
-    compute_encoder.set_input_array(g_out, 4);
-    compute_encoder.set_output_array(grad_hidden_f32, 5);  // Use float32 buffer
-    compute_encoder.set_output_array(grad_weight_f32, 6);  // Use float32 buffer
-    compute_encoder.set_bytes(params, 7);  // CHANGED: was 9
-
-    // Threadgroup memory: H_smem + W_smem + logits_smem + d_logits_smem + tg_max_abs
-    size_t smem_size = (BLOCK_B * BLOCK_D + BLOCK_V * BLOCK_D +
-                        BLOCK_B * BLOCK_V * 2 + 4) * sizeof(float);
-    compute_encoder.set_threadgroup_memory_length(smem_size, 0);
-
-    // 2D grid: (B_tiles, V_tiles)
-    int b_tiles = (N + BLOCK_B - 1) / BLOCK_B;
-    int v_tiles = (V + BLOCK_V - 1) / BLOCK_V;
-    MTL::Size grid_dims = MTL::Size(b_tiles, v_tiles, 1);
-    MTL::Size group_dims = MTL::Size(TILED_THREADS, 1, 1);
-    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-
-    // FP32 outputs written directly, no conversion needed
-
-    d.add_temporary(logsumexp, s.index);
-    d.add_temporary(dummy_loss, s.index);
-
-  } else {
-    // Legacy SIMD-based backward pass
     array logsumexp({N}, float32, nullptr, {});
     logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
     array dummy_loss({N}, float32, nullptr, {});
@@ -725,8 +671,6 @@ void CCELossVJP::eval_gpu(
     }
 
     // Backward pass for grad_hidden and grad_weight using SIMD kernel
-    // (Uses same pattern as forward - each simdgroup processes one token)
-    // Note: kernel writes float32 to grad_hidden_f32 and grad_weight_f32
     {
       std::string kernel_name = "cce_simd_backward_" + type_to_name(h.dtype());
       auto kernel = d.get_kernel(kernel_name);
@@ -737,8 +681,8 @@ void CCELossVJP::eval_gpu(
       compute_encoder.set_input_array(t, 2);
       compute_encoder.set_input_array(logsumexp, 3);
       compute_encoder.set_input_array(g_out, 4);
-      compute_encoder.set_output_array(grad_hidden_f32, 5);  // Use float32 buffer
-      compute_encoder.set_output_array(grad_weight_f32, 6);  // Use float32 buffer
+      compute_encoder.set_output_array(grad_hidden, 5);
+      compute_encoder.set_output_array(grad_weight, 6);
       compute_encoder.set_bytes(params, 7);
 
       int num_tgs = (N + ROWS_PER_TG - 1) / ROWS_PER_TG;
@@ -747,15 +691,11 @@ void CCELossVJP::eval_gpu(
       compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
     }
 
-    // FP32 outputs written directly, no conversion needed
-
     d.add_temporary(logsumexp, s.index);
     d.add_temporary(dummy_loss, s.index);
   }
 
   d.add_temporary(g_out_expanded, s.index);
-  d.add_temporary(std::move(zero_val), s.index);
-
   d.add_temporaries(std::move(copies), s.index);
 }
 

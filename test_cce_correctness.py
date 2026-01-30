@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Test CCE correctness with stable training settings"""
+"""Test CCE correctness with stable training settings - supports both BF16 and FP32"""
+import argparse
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
@@ -11,20 +12,32 @@ def to_fp32(x):
         return x.astype(mx.float32)
     return x
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default="mlx-community/Qwen3-0.6B-bf16")
+parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
+parser.add_argument("--batch-size", type=int, default=16)
+parser.add_argument("--seq-length", type=int, default=128)
+parser.add_argument("--lr", type=float, default=1e-6)
+parser.add_argument("--steps", type=int, default=20)
+args = parser.parse_args()
+
 # Load model
 print("Loading model...")
-model, tok = load('mlx-community/Qwen3-0.6B-bf16')
-model.update(tree_map(to_fp32, model.parameters()))
+model, tok = load(args.model)
+
+if args.dtype == "fp32":
+    model.update(tree_map(to_fp32, model.parameters()))
+# BF16: keep native dtype
+
 mx.eval(model.parameters())
+print(f"Model dtype: {model.model.embed_tokens.weight.dtype}")
 
-# Smaller batch for stability
-batch_size = 16
-seq_length = 128
-tokens = tok.encode('Hello world. ' * 30)[:seq_length]
-batch = mx.array([tokens] * batch_size, dtype=mx.int32)
-lengths = mx.array([[0, len(tokens)-1]] * batch_size, dtype=mx.int32)
+# Create batch
+tokens = tok.encode('Hello world. ' * 30)[:args.seq_length]
+batch = mx.array([tokens] * args.batch_size, dtype=mx.int32)
+lengths = mx.array([[0, len(tokens)-1]] * args.batch_size, dtype=mx.int32)
 
-print(f"Batch: {batch_size} x {seq_length}")
+print(f"Batch: {args.batch_size} x {args.seq_length}")
 print()
 
 # Loss functions
@@ -52,22 +65,18 @@ def cce_loss(model, batch, lengths):
 initial_weights = tree_map(lambda x: mx.array(x) if isinstance(x, mx.array) else x, model.parameters())
 mx.eval(initial_weights)
 
-# STABLE TRAINING SETTINGS
-lr = 1e-6  # Much lower learning rate
-num_steps = 20
-
-print(f"Settings: lr={lr}, steps={num_steps}")
+print(f"Settings: lr={args.lr}, steps={args.steps}, dtype={args.dtype}")
 print()
 
 # Test baseline
 print("=== BASELINE ===")
 model.update(initial_weights)
 mx.eval(model.parameters())
-opt = optim.Adam(learning_rate=lr)
+opt = optim.Adam(learning_rate=args.lr)
 lvg = nn.value_and_grad(model, baseline_loss)
 
 baseline_losses = []
-for i in range(num_steps):
+for i in range(args.steps):
     (l, _), g = lvg(model, batch, lengths)
     # Gradient clipping
     g = tree_map(lambda x: mx.clip(x, -1.0, 1.0) if isinstance(x, mx.array) else x, g)
@@ -82,11 +91,11 @@ print()
 print("=== CCE ===")
 model.update(initial_weights)
 mx.eval(model.parameters())
-opt = optim.Adam(learning_rate=lr)
+opt = optim.Adam(learning_rate=args.lr)
 lvg = nn.value_and_grad(model, cce_loss)
 
 cce_losses = []
-for i in range(num_steps):
+for i in range(args.steps):
     (l, _), g = lvg(model, batch, lengths)
     # Gradient clipping
     g = tree_map(lambda x: mx.clip(x, -1.0, 1.0) if isinstance(x, mx.array) else x, g)
@@ -100,7 +109,7 @@ for i in range(num_steps):
 print()
 print("=== COMPARISON ===")
 max_diff = 0
-for i in range(num_steps):
+for i in range(args.steps):
     diff = abs(baseline_losses[i] - cce_losses[i])
     rel = diff / (baseline_losses[i] + 1e-10) * 100
     max_diff = max(max_diff, rel)
@@ -109,7 +118,10 @@ for i in range(num_steps):
 
 print()
 print(f"Max relative difference: {max_diff:.4f}%")
-if max_diff < 1.0:
-    print("✓ CCE is working correctly (< 1% difference)")
+
+# Tolerance depends on dtype
+tolerance = 5.0 if args.dtype == "bf16" else 1.0
+if max_diff < tolerance:
+    print(f"CCE is working correctly (< {tolerance}% difference for {args.dtype})")
 else:
-    print("✗ CCE may have issues (> 1% difference)")
+    print(f"CCE may have issues (> {tolerance}% difference)")

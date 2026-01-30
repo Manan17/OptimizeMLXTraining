@@ -1776,33 +1776,30 @@ template <typename T, int N_READS = 4>
   normalizer *= fast::exp(prevmax - maxval);
   normalizer = simd_sum(normalizer);
 
-  // Cross-simdgroup reduction
-  prevmax = maxval;
+  // Cross-simdgroup reduction (simplified for correctness)
+  // Store SIMD results to shared memory
   if (simd_lid == 0) {
     smem_max[simd_gid] = maxval;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Each thread reads all simdgroup maxes for final max
-  maxval = simd_max(smem_max[simd_lid < NUM_SIMDGROUPS ? simd_lid : 0]);
-  // Limit to valid simdgroups
-  if (simd_lid >= NUM_SIMDGROUPS) {
-    maxval = smem_max[0];
-  }
-  float chunk_max = maxval;
-
-  // Rescale and reduce normalizer across simdgroups
-  normalizer *= fast::exp(prevmax - chunk_max);
-  if (simd_lid == 0) {
     smem_sum[simd_gid] = normalizer;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  float chunk_sum_exp = 0.0f;
-  if (simd_lid < NUM_SIMDGROUPS) {
-    chunk_sum_exp = smem_sum[simd_lid];
+  // Only first simdgroup does the final reduction (thread 0 will use the result)
+  float chunk_max = smem_max[0];
+  float chunk_sum_exp = smem_sum[0];
+
+  if (simd_gid == 0 && simd_lid == 0) {
+    // Sequential reduction for determinism
+    for (int i = 1; i < NUM_SIMDGROUPS; i++) {
+      float sg_max = smem_max[i];
+      float sg_sum = smem_sum[i];
+
+      float new_max = max(chunk_max, sg_max);
+      chunk_sum_exp = chunk_sum_exp * fast::exp(chunk_max - new_max) +
+                      sg_sum * fast::exp(sg_max - new_max);
+      chunk_max = new_max;
+    }
   }
-  chunk_sum_exp = simd_sum(chunk_sum_exp);
 
   // Thread 0 updates running values
   if (lid == 0) {

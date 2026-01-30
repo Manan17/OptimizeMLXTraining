@@ -32,26 +32,12 @@ constexpr int THREADS_PER_TG = SIMD_SIZE * ROWS_PER_TG;  // 128 threads
 // Base chunk size for large batches
 constexpr int BASE_CHUNK_V = 16384;
 
-// Adaptive chunk size based on batch size to optimize dispatch overhead vs memory
-// Key insight: For small N, dispatch overhead dominates, so use larger chunks (fewer dispatches)
-// For N in [768, 1280] (batch=8 zone), the fixed 16384 causes pathological behavior
+// Adaptive chunk size based on batch size
+// Use consistent chunk size to avoid numerical issues with varying chunk sizes
 inline int get_adaptive_chunk_v(int N, int V, int H) {
-  // Very small batches: no chunking needed, process entire vocab
-  if (N < 256) {
-    return V;
-  }
-
-  // Small batches (N < 512): use larger chunks to minimize dispatch overhead
-  if (N < 512) {
-    return std::min(32768, V);
-  }
-
-  // Medium batches: use standard chunk size
-  if (N < 4096) {
-    return std::min(BASE_CHUNK_V, V);
-  }
-
-  // Large batches: can use larger chunks since memory pressure justifies it
+  // Use consistent chunk size for all batch sizes
+  // Smaller chunks = more numerical stability, more dispatch overhead
+  // 16384 is a good balance for most cases
   return std::min(BASE_CHUNK_V, V);
 }
 
@@ -129,6 +115,8 @@ void CCELoss::eval_gpu(
   //
   // OPTIMIZATION: Skip chunking for very small N where dispatch overhead dominates
   // Dispatch overhead is ~100μs per kernel, which is 15-30% of compute for N<512
+  // Use chunked path for all reasonable batch sizes
+  // N >= 256 covers batch_size >= 2 with typical seq lengths
   bool use_chunked_forward = (V > 2000 && N >= 256);
 
   if (use_chunked_forward) {
@@ -399,6 +387,7 @@ void CCELossVJP::eval_gpu(
 
   // Use chunked backward with steel_matmul for larger problems
   // steel_matmul handles arbitrary dimensions (no H % 8 requirement)
+  // Use chunked backward for all reasonable batch sizes (matches forward)
   bool use_mma = (V > 2000 && N >= 256);
 
   if (use_mma) {
@@ -687,6 +676,13 @@ void CCELossVJP::eval_gpu(
       MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
       MTL::Size group_dims = MTL::Size(THREADS_PER_TG, 1, 1);
       compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    // Zero grad_weight before atomic accumulation (CRITICAL: prevents garbage values)
+    {
+      array zero_val = array(0.0f, float32);
+      fill_gpu(zero_val, grad_weight, s);
+      copies.push_back(std::move(zero_val));
     }
 
     // Backward pass for grad_hidden and grad_weight using SIMD kernel

@@ -1701,6 +1701,14 @@ template <typename T, int N_READS = 4>
   threadgroup float* smem_max = smem;                    // [NUM_SIMDGROUPS]
   threadgroup float* smem_sum = smem + NUM_SIMDGROUPS;   // [NUM_SIMDGROUPS]
 
+  // Initialize shared memory to identity values (like MLX softmax does)
+  // This ensures deterministic behavior even if some slots aren't written
+  if (lid < NUM_SIMDGROUPS) {
+    smem_max[lid] = -INFINITY;  // Identity for max
+    smem_sum[lid] = 0.0f;       // Identity for sum
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
   const int valid_chunk_v = min(chunk_V, V - v_start);
   const int iterations = (valid_chunk_v + THREADS_PER_TG * N_READS - 1) / (THREADS_PER_TG * N_READS);
 

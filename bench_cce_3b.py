@@ -26,7 +26,10 @@ def cce_loss(model, batch, lengths):
     steps = mx.arange(1, targets.shape[1] + 1)
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
     ce = mx.fast.cce_loss(hidden.reshape(B*S, H), weight, targets.reshape(B*S))
-    return (ce * mask.reshape(B*S)).sum() / mask.sum(), mask.sum()
+    # Match default_loss: FP32 reduction
+    ntoks = mask.sum()
+    ce = (ce * mask.reshape(B*S)).astype(mx.float32).sum() / ntoks
+    return ce, ntoks
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default="mlx-community/Llama-3.2-3B-Instruct-bf16")

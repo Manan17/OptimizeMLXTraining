@@ -48,7 +48,10 @@ def baseline_loss(model, batch, lengths):
     steps = mx.arange(1, targets.shape[1] + 1)
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
     ce = nn.losses.cross_entropy(logits, targets) * mask
-    return ce.sum() / mask.sum(), mask.sum()
+    # Match default_loss: FP32 reduction
+    ntoks = mask.sum()
+    ce = ce.astype(mx.float32).sum() / ntoks
+    return ce, ntoks
 
 def cce_loss(model, batch, lengths):
     inputs = batch[:, :-1]
@@ -59,7 +62,10 @@ def cce_loss(model, batch, lengths):
     steps = mx.arange(1, targets.shape[1] + 1)
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
     ce = mx.fast.cce_loss(hidden.reshape(B*S, H), weight, targets.reshape(B*S))
-    return (ce * mask.reshape(B*S)).sum() / mask.sum(), mask.sum()
+    # Match default_loss: FP32 reduction
+    ntoks = mask.sum()
+    ce = (ce * mask.reshape(B*S)).astype(mx.float32).sum() / ntoks
+    return ce, ntoks
 
 # Save initial weights
 initial_weights = tree_map(lambda x: mx.array(x) if isinstance(x, mx.array) else x, model.parameters())

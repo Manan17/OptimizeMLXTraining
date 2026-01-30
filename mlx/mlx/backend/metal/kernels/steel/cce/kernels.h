@@ -1617,30 +1617,32 @@ template <typename T, int N_READS = 4>
   // Early exit if completely out of bounds
   if (base_idx >= total_elements) return;
 
-  // Determine row for this batch of elements
-  // All N_READS elements are in the same row (consecutive in vocab dimension)
-  const int row = base_idx / chunk_V;
-  const int base_col = base_idx % chunk_V;
-
-  // Cache row-level values (read once, use N_READS times)
-  const float token_lse = lse[row];
-  const int target = targets[row];
-  const float grad_scale = grad_output[row] * scale;
-
   // Process N_READS elements
+  // NOTE: Elements may cross row boundaries, so we must compute row per-element
   #pragma unroll
   for (int i = 0; i < N_READS; i++) {
     const int idx = base_idx + i;
-    const int col = base_col + i;
-    const int global_v = v_start + col;
 
     // Bounds check
-    if (idx >= total_elements || global_v >= V) {
-      if (idx < total_elements) {
-        d_logits[idx] = T(0.0f);
-      }
+    if (idx >= total_elements) {
       continue;
     }
+
+    // Compute row and column for THIS element (handles row boundary crossing)
+    const int row = idx / chunk_V;
+    const int col = idx % chunk_V;
+    const int global_v = v_start + col;
+
+    // Check vocab bounds
+    if (global_v >= V) {
+      d_logits[idx] = T(0.0f);
+      continue;
+    }
+
+    // Read row-level values for this element's actual row
+    const float token_lse = lse[row];
+    const int target = targets[row];
+    const float grad_scale = grad_output[row] * scale;
 
     // Read logit in native dtype, convert to FP32
     float logit = float(logits[idx]);

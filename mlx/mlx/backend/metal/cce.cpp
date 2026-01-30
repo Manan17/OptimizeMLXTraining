@@ -46,13 +46,6 @@ inline int get_adaptive_chunk_v(int N, int V, int H) {
     return std::min(32768, V);
   }
 
-  // Problem zone: batch=8 with seq=128 gives N=1024
-  // Fixed CHUNK_V=16384 triggers suboptimal steel_matmul paths
-  // Use smaller chunks to distribute work better
-  if (N >= 768 && N <= 1280) {
-    return std::min(8192, V);
-  }
-
   // Medium batches: use standard chunk size
   if (N < 4096) {
     return std::min(BASE_CHUNK_V, V);

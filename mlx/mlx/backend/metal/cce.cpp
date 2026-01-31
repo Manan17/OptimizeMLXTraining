@@ -408,15 +408,11 @@ void CCELossVJP::eval_gpu(
 
     if (use_saved_lse) {
       // Use logsumexp saved from forward pass (avoids ~0.5GB recomputation)
+      // FIX: Always copy instead of sharing buffer to avoid offset/stride issues
       const array& saved_lse = inputs[4];
-      if (saved_lse.flags().row_contiguous) {
-        logsumexp.copy_shared_buffer(saved_lse);
-        // No need to add as temporary - it's a shared buffer
-      } else {
-        logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
-        copy_gpu(saved_lse, logsumexp, CopyType::General, s);
-        logsumexp_needs_temp = true;
-      }
+      logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
+      copy_gpu(saved_lse, logsumexp, CopyType::General, s);
+      logsumexp_needs_temp = true;
     } else {
       logsumexp_needs_temp = true;
       // Recompute logsumexp (fallback path)

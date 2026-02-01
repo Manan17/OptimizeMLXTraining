@@ -536,6 +536,14 @@ void CCELossVJP::eval_gpu(
     array logits_chunk({N, max_chunk_v}, compute_dtype, nullptr, {});
     logits_chunk.set_data(allocator::malloc(logits_chunk.nbytes()));
 
+    // M1 BF16 FIX: On M1 (no NAX) with BF16, we need a SEPARATE buffer for d_logits
+    // to avoid buffer aliasing issues. On M2/M3 (has NAX) or with FP32, in-place is fine.
+    const bool needs_separate_d_logits = use_bf16 && !metal::is_nax_available();
+    array d_logits_chunk({N, max_chunk_v}, compute_dtype, nullptr, {});
+    if (needs_separate_d_logits) {
+      d_logits_chunk.set_data(allocator::malloc(d_logits_chunk.nbytes()));
+    }
+
     // OPTIMIZATION: Cache kernel lookup outside loop
     // Use dtype-specific kernel (handles BF16→FP32→BF16 conversion in registers)
     std::string d_logits_kernel_name = "cce_compute_d_logits_" + type_to_name(h.dtype());
@@ -570,11 +578,19 @@ void CCELossVJP::eval_gpu(
           false, true,    // transpose_a, transpose_b
           copies);
 
-      // Step 2: Compute d_logits (in-place, kernel does BF16→FP32→BF16 in registers)
+      // Step 2: Compute d_logits
+      // On M1 with BF16: use separate buffer to avoid aliasing issues
+      // On M2/M3 or FP32: use in-place (same buffer as logits) for efficiency
       array d_logits_view({N, current_chunk_v}, compute_dtype, nullptr, {});
-      d_logits_view.copy_shared_buffer(
-          logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
-          static_cast<size_t>(N * current_chunk_v), 0);
+      if (needs_separate_d_logits) {
+        d_logits_view.copy_shared_buffer(
+            d_logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, d_logits_chunk.flags(),
+            static_cast<size_t>(N * current_chunk_v), 0);
+      } else {
+        d_logits_view.copy_shared_buffer(
+            logits_chunk, {static_cast<int64_t>(current_chunk_v), 1}, logits_chunk.flags(),
+            static_cast<size_t>(N * current_chunk_v), 0);
+      }
 
       compute_encoder.set_compute_pipeline_state(d_logits_kernel);
       compute_encoder.set_input_array(logits_view, 0);
@@ -640,6 +656,9 @@ void CCELossVJP::eval_gpu(
       d.add_temporary(logsumexp, s.index);
     }
     d.add_temporary(logits_chunk, s.index);
+    if (needs_separate_d_logits) {
+      d.add_temporary(d_logits_chunk, s.index);
+    }
 
   } else {
     // Legacy SIMD-based backward pass (only for small problems)

@@ -295,67 +295,6 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
-      "flce_loss",
-      &mx::fast::flce_loss,
-      "hidden"_a,
-      "weight"_a,
-      "targets"_a,
-      nb::kw_only(),
-      "chunk_size"_a = 4096,
-      "ignore_index"_a = -100,
-      "stream"_a = nb::none(),
-      nb::sig(
-          "def flce_loss(hidden: array, weight: array, targets: array, *, chunk_size: int = 4096, ignore_index: int = -100, stream: Union[None, Stream, Device] = None) -> array"),
-      R"pbdoc(
-        Fused Linear Cross Entropy loss with memory-efficient chunked computation.
-
-        Computes cross entropy loss without materializing the full ``[N, V]`` logits
-        tensor by processing vocabulary in chunks using the online softmax algorithm.
-        This significantly reduces memory usage for large vocabulary models.
-
-        The computation is equivalent to::
-
-            logits = hidden @ weight.T
-            loss = cross_entropy(logits, targets, ignore_index=ignore_index)
-
-        But uses O(N * chunk_size) memory instead of O(N * V).
-
-        Args:
-            hidden (array): Input hidden states with shape ``[N, H]`` or ``[B, T, H]``
-                where N is the number of tokens, H is the hidden dimension.
-            weight (array): Language model head weight with shape ``[V, H]``
-                where V is the vocabulary size.
-            targets (array): Target indices with shape ``[N]`` or ``[B, T]``.
-                Values should be in ``[0, V)`` or equal to ``ignore_index``.
-            chunk_size (int): Vocabulary chunk size for memory-efficient computation.
-                Larger values use more memory but may be faster. Default: ``4096``.
-            ignore_index (int): Target index to ignore in loss computation.
-                Tokens with this target value do not contribute to the loss.
-                Default: ``-100``.
-
-        Returns:
-            array: Scalar loss value (mean cross entropy over non-ignored tokens).
-
-        Example:
-
-          .. code-block:: python
-
-            import mlx.core as mx
-
-            # Model outputs
-            hidden = mx.random.normal(shape=(32, 256, 768))  # [B, T, H]
-            weight = mx.random.normal(shape=(50000, 768))    # [V, H]
-            targets = mx.random.randint(0, 50000, shape=(32, 256))
-
-            # Memory-efficient cross entropy
-            loss = mx.fast.flce_loss(hidden, weight, targets)
-
-            # Equivalent to (but uses less memory):
-            # logits = hidden.reshape(-1, 768) @ weight.T
-            # loss = mx.mean(mx.nn.losses.cross_entropy(logits, targets.reshape(-1)))
-      )pbdoc");
-
-  m.def(
       "cce_loss",
       &mx::fast::cce_loss,
       "hidden"_a,

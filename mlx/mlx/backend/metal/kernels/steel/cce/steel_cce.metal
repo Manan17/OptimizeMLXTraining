@@ -1,49 +1,11 @@
 // Copyright © 2025 Apple Inc.
 //
 // CCE (Cut Cross-Entropy) Kernel Instantiations
-//
-// Current implementation uses steel_matmul with chunked processing for best performance.
-// Legacy SIMD kernels kept for small problem sizes where dispatch overhead dominates.
+// Uses steel_matmul with chunked processing for best performance.
 
 #include <metal_stdlib>
 #include "mlx/backend/metal/kernels/bf16.h"
 #include "mlx/backend/metal/kernels/steel/cce/kernels.h"
-
-// =============================================================================
-// SIMD Forward Kernels (legacy, for small problems)
-// =============================================================================
-
-#define instantiate_cce_simd_forward(name, type)                             \
-  template [[host_name("cce_simd_forward_" #name)]]                          \
-  [[kernel]] void mlx::steel::cce_simd_forward<type>(                        \
-      const device type* hidden [[buffer(0)]],                               \
-      const device type* weight [[buffer(1)]],                               \
-      const device int32_t* targets [[buffer(2)]],                           \
-      device float* loss [[buffer(3)]],                                      \
-      device float* logsumexp_out [[buffer(4)]],                             \
-      constant mlx::steel::CCEParams& params [[buffer(5)]],                  \
-      uint3 tid [[threadgroup_position_in_grid]],                            \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
-      uint simd_lid [[thread_index_in_simdgroup]]);
-
-// =============================================================================
-// SIMD Backward Kernels (legacy, for small problems)
-// =============================================================================
-
-#define instantiate_cce_simd_backward(name, type)                            \
-  template [[host_name("cce_simd_backward_" #name)]]                         \
-  [[kernel]] void mlx::steel::cce_simd_backward<type>(                       \
-      const device type* hidden [[buffer(0)]],                               \
-      const device type* weight [[buffer(1)]],                               \
-      const device int32_t* targets [[buffer(2)]],                           \
-      const device float* logsumexp [[buffer(3)]],                           \
-      const device float* grad_output [[buffer(4)]],                         \
-      device float* grad_hidden [[buffer(5)]],                               \
-      device float* grad_weight [[buffer(6)]],                               \
-      constant mlx::steel::CCEParams& params [[buffer(7)]],                  \
-      uint3 tid [[threadgroup_position_in_grid]],                            \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
-      uint simd_lid [[thread_index_in_simdgroup]]);
 
 // =============================================================================
 // Compute d_logits Kernel (used in chunked backward with steel_matmul)
@@ -89,15 +51,6 @@
 // =============================================================================
 // Instantiate for all supported types
 // =============================================================================
-
-// SIMD versions (legacy, for small problems where dispatch overhead dominates)
-instantiate_cce_simd_forward(float32, float)
-instantiate_cce_simd_forward(float16, half)
-instantiate_cce_simd_forward(bfloat16, bfloat16_t)
-
-instantiate_cce_simd_backward(float32, float)
-instantiate_cce_simd_backward(float16, half)
-instantiate_cce_simd_backward(bfloat16, bfloat16_t)
 
 // Compute d_logits (used in chunked backward with steel_matmul)
 instantiate_cce_compute_d_logits(float32, float)

@@ -2,16 +2,13 @@
 //
 // CCE (Cut Cross-Entropy) Metal Kernels
 // Vocabulary-tiled implementation following Steel patterns
-//
-// Current implementation uses steel_matmul with chunked processing for best performance.
-// Legacy SIMD kernels kept for small problem sizes where dispatch overhead dominates.
+// Uses steel_matmul with chunked processing for best performance.
 
 #pragma once
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include "mlx/backend/metal/kernels/bf16.h"
-#include "mlx/backend/metal/kernels/steel/cce/params.h"
 
 using namespace metal;
 
@@ -30,174 +27,13 @@ METAL_FUNC float safe_exp(T x) {
   return fast::exp(fx);
 }
 
-// =============================================================================
-// CCE SIMD Backward - Legacy kernel for small problems
-// Used when V <= 2000 or N < 256 where dispatch overhead dominates
-// =============================================================================
-
-template <typename T>
-[[kernel]] void cce_simd_backward(
-    const device T* hidden [[buffer(0)]],         // [N, H]
-    const device T* weight [[buffer(1)]],         // [V, H]
-    const device int32_t* targets [[buffer(2)]],  // [N]
-    const device float* logsumexp [[buffer(3)]],  // [N]
-    const device float* grad_output [[buffer(4)]],// [N] per-token gradients
-    device float* grad_hidden [[buffer(5)]],      // [N, H]
-    device float* grad_weight [[buffer(6)]],      // [V, H] - accumulated with atomics
-    constant CCEParams& params [[buffer(7)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-
-  const int N = params.N;
-  const int H = params.H;
-  const int V = params.V;
-
-  constexpr int SIMD_SIZE = 32;
-  constexpr int ROWS_PER_TG = 4;
-
-  const int row = tid.x * ROWS_PER_TG + simd_gid;
-  if (row >= N) return;
-
-  const int target = targets[row];
-  const float lse = logsumexp[row];
-  const float upstream_grad = grad_output[row];
-
-  const int elems_per_thread = (H + SIMD_SIZE - 1) / SIMD_SIZE;
-  const int h_start = simd_lid * elems_per_thread;
-
-  // Handle ignored tokens
-  if (target == params.ignore_index || target < 0 || target >= V) {
-    for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-      grad_hidden[row * H + h_start + i] = 0.0f;
-    }
-    return;
-  }
-
-  // Load hidden into registers
-  float h_local[64];
-  for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-    h_local[i] = float(hidden[row * H + h_start + i]);
-  }
-
-  // Initialize gradient accumulator
-  float grad_h_local[64];
-  for (int i = 0; i < elems_per_thread; i++) {
-    grad_h_local[i] = 0.0f;
-  }
-
-  // Process all vocabulary entries
-  for (int v = 0; v < V; v++) {
-    // Compute logit
-    float partial = 0.0f;
-    for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-      partial += h_local[i] * float(weight[v * H + h_start + i]);
-    }
-    float logit = simd_sum(partial);
-
-    // Compute gradient: (softmax - onehot) * upstream
-    float prob = safe_exp(logit - lse);
-    prob = clamp(prob, 0.0f, 1.0f);
-    float grad_logit = prob;
-    if (v == target) {
-      grad_logit -= 1.0f;
-    }
-    grad_logit *= upstream_grad * params.scale;
-
-    // Accumulate grad_hidden
-    for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-      grad_h_local[i] += grad_logit * float(weight[v * H + h_start + i]);
-    }
-
-    // Accumulate grad_weight using atomics
-    for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-      atomic_fetch_add_explicit(
-          (device atomic<float>*)&grad_weight[v * H + h_start + i],
-          grad_logit * h_local[i],
-          memory_order_relaxed);
-    }
-  }
-
-  // Write output
-  for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-    grad_hidden[row * H + h_start + i] = grad_h_local[i];
-  }
-}
-
-// =============================================================================
-// CCE SIMD Forward - Legacy kernel for small problems
-// Used when V <= 2000 or N < 256 where dispatch overhead dominates
-// =============================================================================
-
-template <typename T>
-[[kernel]] void cce_simd_forward(
-    const device T* hidden [[buffer(0)]],
-    const device T* weight [[buffer(1)]],
-    const device int32_t* targets [[buffer(2)]],
-    device float* loss [[buffer(3)]],
-    device float* logsumexp_out [[buffer(4)]],
-    constant CCEParams& params [[buffer(5)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-
-  const int N = params.N;
-  const int H = params.H;
-  const int V = params.V;
-
-  constexpr int SIMD_SIZE = 32;
-  constexpr int ROWS_PER_TG = 4;
-
-  const int row = tid.x * ROWS_PER_TG + simd_gid;
-  if (row >= N) return;
-
-  const int target = targets[row];
-
-  const int elems_per_thread = (H + SIMD_SIZE - 1) / SIMD_SIZE;
-  const int h_start = simd_lid * elems_per_thread;
-
-  // Load hidden into registers
-  float h_local[64];
-  for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-    h_local[i] = float(hidden[row * H + h_start + i]);
-  }
-
-  // Online softmax state
-  float running_max = -INFINITY;
-  float running_sum = 0.0f;
-  float target_logit = 0.0f;
-
-  // Process vocabulary
-  for (int v = 0; v < V; v++) {
-    float partial = 0.0f;
-    for (int i = 0; i < elems_per_thread && h_start + i < H; i++) {
-      partial += h_local[i] * float(weight[v * H + h_start + i]);
-    }
-    float logit = simd_sum(partial);
-
-    if (v == target) {
-      target_logit = logit;
-    }
-
-    // Online softmax update
-    float new_max = max(running_max, logit);
-    float scale_old = safe_exp(running_max - new_max);
-    float scale_new = safe_exp(logit - new_max);
-    running_sum = running_sum * scale_old + scale_new;
-    running_max = new_max;
-  }
-
-  // Output
-  if (simd_lid == 0) {
-    float lse = running_max + log(running_sum + 1e-9f);
-    logsumexp_out[row] = lse;
-
-    if (target >= 0 && target < V && target != params.ignore_index) {
-      loss[row] = (lse - target_logit) * params.scale;
-    } else {
-      loss[row] = 0.0f;
-    }
-  }
+// Safe exp(a - b) for online logsumexp
+// Handles edge case where a = -INFINITY (padding for small vocab)
+// Returns 0 when a = -INFINITY since exp(-inf) = 0
+// Avoids NaN from -inf - (-inf) = indeterminate
+METAL_FUNC float safe_exp_diff(float a, float b) {
+  if (a <= -INFINITY) return 0.0f;
+  return fast::exp(a - b);
 }
 
 // =============================================================================
@@ -348,17 +184,17 @@ template <typename T, int N_READS = 4>
       maxval = (maxval < vals[i]) ? vals[i] : maxval;
     }
 
-    normalizer *= fast::exp(prevmax - maxval);
+    normalizer *= safe_exp_diff(prevmax, maxval);
 
     #pragma unroll
     for (int i = 0; i < N_READS; i++) {
-      normalizer += fast::exp(vals[i] - maxval);
+      normalizer += safe_exp_diff(vals[i], maxval);
     }
   }
 
   prevmax = maxval;
   maxval = simd_max(maxval);
-  normalizer *= fast::exp(prevmax - maxval);
+  normalizer *= safe_exp_diff(prevmax, maxval);
   normalizer = simd_sum(normalizer);
 
   if (simd_lid == 0) {
@@ -376,8 +212,8 @@ template <typename T, int N_READS = 4>
       float sg_sum = smem_sum[i];
 
       float new_max = max(chunk_max, sg_max);
-      chunk_sum_exp = chunk_sum_exp * fast::exp(chunk_max - new_max) +
-                      sg_sum * fast::exp(sg_max - new_max);
+      chunk_sum_exp = chunk_sum_exp * safe_exp_diff(chunk_max, new_max) +
+                      sg_sum * safe_exp_diff(sg_max, new_max);
       chunk_max = new_max;
     }
   }
@@ -387,8 +223,8 @@ template <typename T, int N_READS = 4>
     float old_sum_exp = running_sum_exp[row];
 
     float new_max = max(old_max, chunk_max);
-    float new_sum_exp = old_sum_exp * fast::exp(old_max - new_max) +
-                        chunk_sum_exp * fast::exp(chunk_max - new_max);
+    float new_sum_exp = old_sum_exp * safe_exp_diff(old_max, new_max) +
+                        chunk_sum_exp * safe_exp_diff(chunk_max, new_max);
 
     running_max[row] = new_max;
     running_sum_exp[row] = new_sum_exp;

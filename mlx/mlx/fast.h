@@ -100,29 +100,6 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     bool ensure_row_contiguous = false,
     StreamOrDevice s = {});
 
-/** Computes fused linear cross entropy loss efficiently
- *
- * This function computes cross entropy loss without materializing the full
- * [N, V] logits tensor by processing vocabulary in chunks using online softmax.
- *
- * Args:
- *   hidden: Input hidden states [N, H] or [B, T, H]
- *   weight: Language model head weight [V, H]
- *   targets: Target indices [N] or [B, T]
- *   chunk_size: Vocabulary chunk size for memory-efficient computation
- *   ignore_index: Target index to ignore in loss computation
- *
- * Returns:
- *   Scalar loss value
- */
-MLX_API array flce_loss(
-    const array& hidden,
-    const array& weight,
-    const array& targets,
-    int chunk_size = 4096,
-    int ignore_index = -100,
-    StreamOrDevice s = {});
-
 /** Computes Cut Cross-Entropy loss efficiently
  *
  * CCE computes cross-entropy loss without materializing the full logits tensor

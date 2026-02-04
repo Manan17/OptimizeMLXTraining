@@ -12,38 +12,60 @@
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
-#include "mlx/backend/metal/kernels/steel/cce/params.h"
 #include "mlx/backend/metal/matmul.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 namespace mlx::core::fast {
 
+// Chunked forward/backward constants
+constexpr int MAX_CHUNK_V = 16384;
+constexpr int MIN_CHUNK_V = 1024;
 
-// Dispatch constants for legacy kernels
-constexpr int SIMD_SIZE = 32;
-constexpr int ROWS_PER_TG = 4;
-constexpr int THREADS_PER_TG = SIMD_SIZE * ROWS_PER_TG;  // 128 threads
-
-
-// Note: MMA constants removed - custom MMA kernel is slower than steel_matmul chunked approach
-
-// Chunked backward constants
-// Base chunk size for large batches
-constexpr int BASE_CHUNK_V = 16384;
-
-// Adaptive chunk size based on batch size
-// Use consistent chunk size to avoid numerical issues with varying chunk sizes
+// Two-tier adaptive chunking:
+// - Small N (≤2048): Use max chunk for speed (fewer dispatches)
+// - Large N (>2048): Scale chunk to ~0.5% of system RAM (memory safety)
 inline int get_adaptive_chunk_v(int N, int V, int H) {
-  // Use consistent chunk size for all batch sizes
-  // Smaller chunks = more numerical stability, more dispatch overhead
-  // 16384 is a good balance for most cases
-  return std::min(BASE_CHUNK_V, V);
-}
+  // For small N, use maximum chunk size for speed
+  if (N <= 2048) {
+    return std::min(MAX_CHUNK_V, V);
+  }
 
-// Legacy constants for fallback
-constexpr int DEFAULT_BV = 256;
-constexpr int DEFAULT_BH = 64;
+  // For large N, compute memory-adaptive chunk size
+  // Target: ~0.5% of system RAM as chunk budget
+  // This scales with machine: 36GB→180MB, 64GB→320MB, 128GB→640MB
+  constexpr size_t BYTES_PER_ELEMENT = 4;  // float32
+
+  // Get system memory (fallback to 64GB if unavailable)
+  size_t system_memory = 64ULL * 1024 * 1024 * 1024;  // 64GB default
+#if defined(__APPLE__)
+  size_t size = sizeof(system_memory);
+  if (sysctlbyname("hw.memsize", &system_memory, &size, nullptr, 0) != 0) {
+    system_memory = 64ULL * 1024 * 1024 * 1024;  // Fallback
+  }
+#endif
+
+  // Chunk budget = 0.5% of system RAM
+  size_t chunk_budget = system_memory / 200;
+
+  // Calculate max chunk that fits in budget: N * chunk_v * 4 bytes ≤ budget
+  int max_chunk_from_memory = static_cast<int>(chunk_budget / (static_cast<size_t>(N) * BYTES_PER_ELEMENT));
+
+  // Clamp to reasonable range and align to 256 for efficient GPU dispatch
+  int chunk_v = std::min({MAX_CHUNK_V, V, std::max(MIN_CHUNK_V, max_chunk_from_memory)});
+  chunk_v = (chunk_v / 256) * 256;
+
+  // Ensure minimum chunk size
+  if (chunk_v < MIN_CHUNK_V) {
+    chunk_v = std::min(MIN_CHUNK_V, V);
+  }
+
+  return chunk_v;
+}
 
 void CCELoss::eval_gpu(
     const std::vector<array>& inputs,
@@ -105,21 +127,13 @@ void CCELoss::eval_gpu(
   }
 
   float scale = 1.0f;
-  mlx::steel::CCEParams params{N, H, V, ignore_index_, scale};
 
   auto& compute_encoder = d.get_command_encoder(s.index);
 
-  // Use chunked forward with steel_matmul for large vocab (best performance)
+  // Use chunked forward with steel_matmul (memory efficient)
   // This computes logits in chunks and reduces to logsumexp
-  // For small problems, fall back to simple SIMD kernel
-  //
-  // OPTIMIZATION: Skip chunking for very small N where dispatch overhead dominates
-  // Dispatch overhead is ~100μs per kernel, which is 15-30% of compute for N<512
-  // Use chunked path for all reasonable batch sizes
-  // N >= 256 covers batch_size >= 2 with typical seq lengths
-  bool use_chunked_forward = (V > 2000 && N >= 256);
-
-  if (use_chunked_forward) {
+  // Note: N >= 256 is enforced in fast.cpp (smaller N uses baseline fallback)
+  {
     // Chunked forward: use steel_matmul + reduction for speed
     // This is O(N*chunk_V) memory per chunk vs O(N*V) for baseline
 
@@ -270,30 +284,6 @@ void CCELoss::eval_gpu(
 
     d.add_temporary(logits_chunk, s.index);
     d.add_temporary(running_state, s.index);  // Consolidated buffer (views share this)
-
-  } else {
-    // Simple SIMD kernel for smaller problems
-    array logsumexp({N}, float32, nullptr, {});
-    logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
-
-    std::string kernel_name = "cce_simd_forward_" + type_to_name(h.dtype());
-
-    auto kernel = d.get_kernel(kernel_name);
-    compute_encoder.set_compute_pipeline_state(kernel);
-
-    compute_encoder.set_input_array(h, 0);
-    compute_encoder.set_input_array(w, 1);
-    compute_encoder.set_input_array(t, 2);
-    compute_encoder.set_output_array(loss, 3);
-    compute_encoder.set_output_array(logsumexp, 4);
-    compute_encoder.set_bytes(params, 5);
-
-    int num_tgs = (N + ROWS_PER_TG - 1) / ROWS_PER_TG;
-    MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
-    MTL::Size group_dims = MTL::Size(THREADS_PER_TG, 1, 1);
-    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-
-    d.add_temporary(logsumexp, s.index);
   }
 
   d.add_temporaries(std::move(copies), s.index);
@@ -381,16 +371,12 @@ void CCELossVJP::eval_gpu(
   }
 
   float scale = 1.0f;
-  mlx::steel::CCEParams params{N, H, V, ignore_index_, scale};
 
   auto& compute_encoder = d.get_command_encoder(s.index);
 
-  // Use chunked backward with steel_matmul for larger problems
-  // steel_matmul handles arbitrary dimensions (no H % 8 requirement)
-  // Use chunked backward for all reasonable batch sizes (matches forward)
-  bool use_mma = (V > 2000 && N >= 256);
-
-  if (use_mma) {
+  // Use chunked backward with steel_matmul (memory efficient)
+  // Note: N >= 256 is enforced in fast.cpp (smaller N uses baseline fallback)
+  {
     // Chunked backward using steel_matmul (avoids atomic contention)
 
     // ADAPTIVE CHUNKING: Use optimal chunk size based on batch size
@@ -659,70 +645,6 @@ void CCELossVJP::eval_gpu(
     if (needs_separate_d_logits) {
       d.add_temporary(d_logits_chunk, s.index);
     }
-
-  } else {
-    // Legacy SIMD-based backward pass (only for small problems)
-    // Note: Legacy path only supports FP32 outputs
-    if (use_bf16) {
-      throw std::invalid_argument(
-          "CCE backward with BF16 requires larger problem size (V > 2000 && N >= 256). "
-          "For small problems, use FP32 inputs.");
-    }
-
-    array logsumexp({N}, float32, nullptr, {});
-    logsumexp.set_data(allocator::malloc(logsumexp.nbytes()));
-    array dummy_loss({N}, float32, nullptr, {});
-    dummy_loss.set_data(allocator::malloc(dummy_loss.nbytes()));
-
-    // Forward pass to get logsumexp
-    {
-      std::string kernel_name = "cce_simd_forward_" + type_to_name(h.dtype());
-      auto kernel = d.get_kernel(kernel_name);
-      compute_encoder.set_compute_pipeline_state(kernel);
-
-      compute_encoder.set_input_array(h, 0);
-      compute_encoder.set_input_array(w, 1);
-      compute_encoder.set_input_array(t, 2);
-      compute_encoder.set_output_array(dummy_loss, 3);
-      compute_encoder.set_output_array(logsumexp, 4);
-      compute_encoder.set_bytes(params, 5);
-
-      int num_tgs = (N + ROWS_PER_TG - 1) / ROWS_PER_TG;
-      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
-      MTL::Size group_dims = MTL::Size(THREADS_PER_TG, 1, 1);
-      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-    }
-
-    // Zero grad_weight before atomic accumulation (CRITICAL: prevents garbage values)
-    {
-      array zero_val = array(0.0f, float32);
-      fill_gpu(zero_val, grad_weight, s);
-      copies.push_back(std::move(zero_val));
-    }
-
-    // Backward pass for grad_hidden and grad_weight using SIMD kernel
-    {
-      std::string kernel_name = "cce_simd_backward_" + type_to_name(h.dtype());
-      auto kernel = d.get_kernel(kernel_name);
-      compute_encoder.set_compute_pipeline_state(kernel);
-
-      compute_encoder.set_input_array(h, 0);
-      compute_encoder.set_input_array(w, 1);
-      compute_encoder.set_input_array(t, 2);
-      compute_encoder.set_input_array(logsumexp, 3);
-      compute_encoder.set_input_array(g_out, 4);
-      compute_encoder.set_output_array(grad_hidden, 5);
-      compute_encoder.set_output_array(grad_weight, 6);
-      compute_encoder.set_bytes(params, 7);
-
-      int num_tgs = (N + ROWS_PER_TG - 1) / ROWS_PER_TG;
-      MTL::Size grid_dims = MTL::Size(num_tgs, 1, 1);
-      MTL::Size group_dims = MTL::Size(THREADS_PER_TG, 1, 1);
-      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-    }
-
-    d.add_temporary(logsumexp, s.index);
-    d.add_temporary(dummy_loss, s.index);
   }
 
   d.add_temporary(g_out_expanded, s.index);

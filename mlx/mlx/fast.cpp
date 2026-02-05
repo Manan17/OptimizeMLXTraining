@@ -948,6 +948,7 @@ array cce_loss(
     const array& weight,
     const array& targets,
     int ignore_index /* = -100 */,
+    float logit_softcap /* = 0.0f */,
     StreamOrDevice s_ /* = {} */) {
   // Validate inputs
   if (hidden.ndim() < 2) {
@@ -1005,7 +1006,7 @@ array cce_loss(
 
   // Fallback implementation using standard MLX ops (for CPU)
   // Uses online logsumexp for memory efficiency
-  auto fallback = [ignore_index, H, V, N, compute_type, s](
+  auto fallback = [ignore_index, logit_softcap, H, V, N, compute_type, s](
                       const std::vector<array>& inputs) {
     auto h = reshape(inputs[0], {N, H}, s);
     auto w = inputs[1];
@@ -1019,6 +1020,12 @@ array cce_loss(
     auto logits = matmul(astype(h, compute_type, s),
                          transpose(astype(w, compute_type, s), s), s);
     logits = astype(logits, float32, s);
+
+    // Apply logit softcapping if enabled (Gemma-2 style models)
+    if (logit_softcap > 0.0f) {
+      logits = multiply(tanh(divide(logits, array(logit_softcap, float32), s), s),
+                        array(logit_softcap, float32), s);
+    }
 
     // Compute logsumexp
     auto lse = logsumexp(logits, -1, false, s);
@@ -1049,7 +1056,7 @@ array cce_loss(
     bool is_training = detail::in_grad_tracing();
     bool output_logsumexp = is_training;
 
-    auto primitive = std::make_shared<CCELoss>(s, fallback, ignore_index, output_logsumexp);
+    auto primitive = std::make_shared<CCELoss>(s, fallback, ignore_index, logit_softcap, output_logsumexp);
 
     if (output_logsumexp) {
       // Return both loss and logsumexp (logsumexp used in backward)
@@ -1093,8 +1100,8 @@ std::vector<array> CCELoss::vjp(
   bool has_logsumexp = output_logsumexp_ && outputs.size() >= 2;
 
   // Fallback VJP implementation (used when logsumexp not provided)
-  auto fallback = [ignore_index = ignore_index_, has_logsumexp,
-                   H, V, N, s](const std::vector<array>& inputs) {
+  auto fallback = [ignore_index = ignore_index_, logit_softcap = logit_softcap_,
+                   has_logsumexp, H, V, N, s](const std::vector<array>& inputs) {
     auto& h = inputs[0];
     auto& w = inputs[1];
     auto& t = inputs[2];
@@ -1107,6 +1114,12 @@ std::vector<array> CCELoss::vjp(
     auto logits = matmul(astype(h, compute_type, s),
                          transpose(astype(w, compute_type, s), s), s);
     logits = astype(logits, float32, s);
+
+    // Apply logit softcapping if enabled (Gemma-2 style models)
+    if (logit_softcap > 0.0f) {
+      logits = multiply(tanh(divide(logits, array(logit_softcap, float32), s), s),
+                        array(logit_softcap, float32), s);
+    }
 
     // Use saved logsumexp if available, otherwise compute it
     auto lse = (has_logsumexp && inputs.size() > 4)
@@ -1165,7 +1178,7 @@ std::vector<array> CCELoss::vjp(
   auto vjps = array::make_arrays(
       {primals[0].shape(), primals[1].shape()},
       {primals[0].dtype(), primals[1].dtype()},
-      std::make_shared<CCELossVJP>(s, fallback, ignore_index_, has_logsumexp),
+      std::make_shared<CCELossVJP>(s, fallback, ignore_index_, logit_softcap_, has_logsumexp),
       std::move(vjp_inputs));
 
   std::vector<array> returned_vjps;
@@ -1183,12 +1196,14 @@ std::vector<array> CCELoss::vjp(
 bool CCELoss::is_equivalent(const Primitive& other) const {
   const CCELoss& a_other = static_cast<const CCELoss&>(other);
   return ignore_index_ == a_other.ignore_index_ &&
+         logit_softcap_ == a_other.logit_softcap_ &&
          output_logsumexp_ == a_other.output_logsumexp_;
 }
 
 bool CCELossVJP::is_equivalent(const Primitive& other) const {
   const CCELossVJP& a_other = static_cast<const CCELossVJP&>(other);
   return ignore_index_ == a_other.ignore_index_ &&
+         logit_softcap_ == a_other.logit_softcap_ &&
          has_logsumexp_ == a_other.has_logsumexp_;
 }
 

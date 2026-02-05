@@ -437,9 +437,11 @@ class CCELoss : public Custom {
       Stream stream,
       std::function<std::vector<array>(std::vector<array>)> fallback,
       int ignore_index,
+      float logit_softcap = 0.0f,
       bool output_logsumexp = false)
       : Custom(stream, std::move(fallback)),
         ignore_index_(ignore_index),
+        logit_softcap_(logit_softcap),
         output_logsumexp_(output_logsumexp) {}
 
   // Use CCE kernel on GPU, fallback on CPU
@@ -469,14 +471,16 @@ class CCELoss : public Custom {
   DEFINE_INPUT_OUTPUT_SHAPE()
 
   auto state() const {
-    return std::make_tuple(nullptr, ignore_index_, output_logsumexp_);
+    return std::make_tuple(nullptr, ignore_index_, logit_softcap_, output_logsumexp_);
   }
 
   int ignore_index() const { return ignore_index_; }
+  float logit_softcap() const { return logit_softcap_; }
   bool output_logsumexp() const { return output_logsumexp_; }
 
  private:
   int ignore_index_;
+  float logit_softcap_;
   bool output_logsumexp_;
 };
 
@@ -489,9 +493,11 @@ class CCELossVJP : public Custom {
       Stream stream,
       std::function<std::vector<array>(std::vector<array>)> fallback,
       int ignore_index,
+      float logit_softcap = 0.0f,
       bool has_logsumexp = false)
       : Custom(stream, std::move(fallback)),
         ignore_index_(ignore_index),
+        logit_softcap_(logit_softcap),
         has_logsumexp_(has_logsumexp) {}
 
   // CPU uses fallback
@@ -510,13 +516,15 @@ class CCELossVJP : public Custom {
   DEFINE_NAME(CCELossVJP)
   bool is_equivalent(const Primitive& other) const override;
   auto state() const {
-    return std::make_tuple(nullptr, ignore_index_, has_logsumexp_);
+    return std::make_tuple(nullptr, ignore_index_, logit_softcap_, has_logsumexp_);
   }
 
+  float logit_softcap() const { return logit_softcap_; }
   bool has_logsumexp() const { return has_logsumexp_; }
 
  private:
   int ignore_index_;
+  float logit_softcap_;
   bool has_logsumexp_;
 };
 

@@ -1,15 +1,8 @@
 // Copyright © 2025 Apple Inc.
-//
-// CCE (Cut Cross-Entropy) Kernel Instantiations
-// Uses steel_matmul with chunked processing for best performance.
 
 #include <metal_stdlib>
 #include "mlx/backend/metal/kernels/bf16.h"
 #include "mlx/backend/metal/kernels/steel/cce/kernels.h"
-
-// =============================================================================
-// Compute d_logits Kernel (used in chunked backward with steel_matmul)
-// =============================================================================
 
 #define instantiate_cce_compute_d_logits(name, type)                             \
   template [[host_name("cce_compute_d_logits_" #name)]]                           \
@@ -24,11 +17,8 @@
       constant int& v_start [[buffer(7)]],                                        \
       constant int& V [[buffer(8)]],                                              \
       constant float& scale [[buffer(9)]],                                        \
+      constant float& softcap [[buffer(10)]],                                     \
       uint tid [[thread_position_in_grid]]);
-
-// =============================================================================
-// Chunk LogSumExp Kernel (used in chunked forward for online logsumexp)
-// =============================================================================
 
 #define instantiate_cce_chunk_logsumexp(name, type)                              \
   template [[host_name("cce_chunk_logsumexp_" #name)]]                           \
@@ -42,26 +32,17 @@
       constant int& chunk_V [[buffer(6)]],                                       \
       constant int& v_start [[buffer(7)]],                                       \
       constant int& V [[buffer(8)]],                                             \
+      constant float& softcap [[buffer(9)]],                                     \
       threadgroup float* smem [[threadgroup(0)]],                                \
       uint3 tgid [[threadgroup_position_in_grid]],                               \
       uint lid [[thread_index_in_threadgroup]],                                  \
       uint simd_lid [[thread_index_in_simdgroup]],                               \
       uint simd_gid [[simdgroup_index_in_threadgroup]]);
 
-// =============================================================================
-// Instantiate for all supported types
-// =============================================================================
-
-// Compute d_logits (used in chunked backward with steel_matmul)
 instantiate_cce_compute_d_logits(float32, float)
 instantiate_cce_compute_d_logits(float16, half)
 instantiate_cce_compute_d_logits(bfloat16, bfloat16_t)
 
-// Chunk logsumexp (used in chunked forward for online logsumexp)
 instantiate_cce_chunk_logsumexp(float32, float)
 instantiate_cce_chunk_logsumexp(float16, half)
 instantiate_cce_chunk_logsumexp(bfloat16, bfloat16_t)
-
-// Non-template kernels (cce_finalize_lse, cce_init_running_values,
-// cce_finalize_loss, cce_finalize_loss_with_lse) are declared with
-// [[host_name(...)]] directly in kernels.h and don't need instantiation here.

@@ -1,8 +1,4 @@
 // Copyright © 2025 Apple Inc.
-//
-// CCE (Cut Cross-Entropy) Metal Kernels
-// Vocabulary-tiled implementation following Steel patterns
-// Uses steel_matmul with chunked processing for best performance.
 
 #pragma once
 
@@ -15,45 +11,42 @@ using namespace metal;
 namespace mlx {
 namespace steel {
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-// Fast exp with overflow protection for online softmax
 template <typename T>
 METAL_FUNC float safe_exp(T x) {
   float fx = float(x);
-  fx = min(fx, 88.0f);  // exp(88) ~ 1.6e38, close to float max
+  fx = min(fx, 88.0f);
   return fast::exp(fx);
 }
 
-// Safe exp(a - b) for online logsumexp
-// Handles edge case where a = -INFINITY (padding for small vocab)
-// Returns 0 when a = -INFINITY since exp(-inf) = 0
-// Avoids NaN from -inf - (-inf) = indeterminate
 METAL_FUNC float safe_exp_diff(float a, float b) {
   if (a <= -INFINITY) return 0.0f;
   return fast::exp(a - b);
 }
 
-// =============================================================================
-// CCE Compute d_logits Kernel (for chunked backward with steel_matmul)
-// Computes d_logits = (softmax - one_hot) * grad_output for a vocab chunk
-// Vectorized: N_READS elements per thread for better memory coalescing
-// =============================================================================
+METAL_FUNC float apply_softcap(float x, float softcap) {
+  if (softcap <= 0.0f) return x;
+  return softcap * fast::tanh(x / softcap);
+}
+
+METAL_FUNC float softcap_grad(float x, float softcap) {
+  if (softcap <= 0.0f) return 1.0f;
+  float t = fast::tanh(x / softcap);
+  return 1.0f - t * t;
+}
 
 template <typename T, int N_READS = 4>
 [[kernel]] void cce_compute_d_logits(
-    const device T* logits [[buffer(0)]],            // [N, chunk_V]
-    const device float* lse [[buffer(1)]],           // [N]
-    const device int32_t* targets [[buffer(2)]],     // [N]
-    const device float* grad_output [[buffer(3)]],   // [N]
-    device T* d_logits [[buffer(4)]],                // [N, chunk_V] - same type as input
+    const device T* logits [[buffer(0)]],
+    const device float* lse [[buffer(1)]],
+    const device int32_t* targets [[buffer(2)]],
+    const device float* grad_output [[buffer(3)]],
+    device T* d_logits [[buffer(4)]],
     constant int& N [[buffer(5)]],
     constant int& chunk_V [[buffer(6)]],
-    constant int& v_start [[buffer(7)]],             // Start index in full vocab
-    constant int& V [[buffer(8)]],                   // Full vocab size
+    constant int& v_start [[buffer(7)]],
+    constant int& V [[buffer(8)]],
     constant float& scale [[buffer(9)]],
+    constant float& softcap [[buffer(10)]],
     uint tid [[thread_position_in_grid]]) {
 
   const int base_idx = tid * N_READS;
@@ -82,35 +75,33 @@ template <typename T, int N_READS = 4>
     const int target = targets[row];
     const float grad_scale = grad_output[row] * scale;
 
-    float logit = float(logits[idx]);
-    float prob = safe_exp(logit - token_lse);
+    float raw_logit = float(logits[idx]);
+    float capped_logit = apply_softcap(raw_logit, softcap);
+
+    float prob = safe_exp(capped_logit - token_lse);
     prob = clamp(prob, 0.0f, 1.0f);
 
-    // Branchless: subtract 1.0 if this is the target
-    float d_logit = prob - float(global_v == target);
-    d_logit *= grad_scale;
+    float d_capped = prob - float(global_v == target);
+    d_capped *= grad_scale;
+
+    float d_logit = d_capped * softcap_grad(raw_logit, softcap);
 
     d_logits[idx] = T(d_logit);
   }
 }
 
-// =============================================================================
-// CCE Chunk LogSumExp Kernel (Single-Pass Online Algorithm)
-// Updates running max and sum_exp for online logsumexp computation
-// One threadgroup per row, threads cooperate on reduction
-// =============================================================================
-
 template <typename T, int N_READS = 4>
 [[kernel]] void cce_chunk_logsumexp(
-    const device T* logits [[buffer(0)]],       // [N, chunk_V]
-    const device int32_t* targets [[buffer(1)]],// [N]
-    device float* running_max [[buffer(2)]],    // [N]
-    device float* running_sum_exp [[buffer(3)]],// [N]
-    device float* target_logit [[buffer(4)]],   // [N]
+    const device T* logits [[buffer(0)]],
+    const device int32_t* targets [[buffer(1)]],
+    device float* running_max [[buffer(2)]],
+    device float* running_sum_exp [[buffer(3)]],
+    device float* target_logit [[buffer(4)]],
     constant int& N [[buffer(5)]],
     constant int& chunk_V [[buffer(6)]],
     constant int& v_start [[buffer(7)]],
     constant int& V [[buffer(8)]],
+    constant float& softcap [[buffer(9)]],
     threadgroup float* smem [[threadgroup(0)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
@@ -152,20 +143,21 @@ template <typename T, int N_READS = 4>
     if (offset + N_READS <= valid_chunk_v) {
       if constexpr (N_READS == 4) {
         vec<T, 4> packed = *reinterpret_cast<const device vec<T, 4>*>(row_logits + offset);
-        vals[0] = float(packed[0]);
-        vals[1] = float(packed[1]);
-        vals[2] = float(packed[2]);
-        vals[3] = float(packed[3]);
+        vals[0] = apply_softcap(float(packed[0]), softcap);
+        vals[1] = apply_softcap(float(packed[1]), softcap);
+        vals[2] = apply_softcap(float(packed[2]), softcap);
+        vals[3] = apply_softcap(float(packed[3]), softcap);
       } else {
         #pragma unroll
         for (int i = 0; i < N_READS; i++) {
-          vals[i] = float(row_logits[offset + i]);
+          vals[i] = apply_softcap(float(row_logits[offset + i]), softcap);
         }
       }
     } else {
       #pragma unroll
       for (int i = 0; i < N_READS; i++) {
-        vals[i] = (offset + i < valid_chunk_v) ? float(row_logits[offset + i]) : -INFINITY;
+        float raw = (offset + i < valid_chunk_v) ? float(row_logits[offset + i]) : -INFINITY;
+        vals[i] = (raw <= -INFINITY) ? raw : apply_softcap(raw, softcap);
       }
     }
 
@@ -250,10 +242,6 @@ template <typename T, int N_READS = 4>
   }
 }
 
-// =============================================================================
-// Helper functions for finalize kernels
-// =============================================================================
-
 METAL_FUNC float cce_compute_lse(float running_max_val, float running_sum_exp_val) {
   return running_max_val + log(running_sum_exp_val + 1e-9f);
 }
@@ -261,10 +249,6 @@ METAL_FUNC float cce_compute_lse(float running_max_val, float running_sum_exp_va
 METAL_FUNC float cce_compute_loss(float lse, float target_logit_val, float scale) {
   return (lse - target_logit_val) * scale;
 }
-
-// =============================================================================
-// CCE Finalize LSE Kernel - Computes logsumexp from running max and sum_exp
-// =============================================================================
 
 [[host_name("cce_finalize_lse")]]
 [[kernel]] void cce_finalize_lse(
@@ -277,10 +261,6 @@ METAL_FUNC float cce_compute_loss(float lse, float target_logit_val, float scale
   if (tid >= uint(N)) return;
   logsumexp[tid] = cce_compute_lse(running_max[tid], running_sum_exp[tid]);
 }
-
-// =============================================================================
-// CCE Init Running Values Kernel - Initializes running state in one dispatch
-// =============================================================================
 
 [[host_name("cce_init_running_values")]]
 [[kernel]] void cce_init_running_values(
@@ -296,10 +276,6 @@ METAL_FUNC float cce_compute_loss(float lse, float target_logit_val, float scale
   running_sum_exp[tid] = 0.0f;
   target_logit[tid] = 0.0f;
 }
-
-// =============================================================================
-// CCE Finalize Loss Kernel - Computes final loss from running state
-// =============================================================================
 
 [[host_name("cce_finalize_loss")]]
 [[kernel]] void cce_finalize_loss(
@@ -324,10 +300,6 @@ METAL_FUNC float cce_compute_loss(float lse, float target_logit_val, float scale
   float lse = cce_compute_lse(running_max[tid], running_sum_exp[tid]);
   loss[tid] = cce_compute_loss(lse, target_logit[tid], scale);
 }
-
-// =============================================================================
-// CCE Finalize Loss With LSE Kernel - Also outputs logsumexp for backward pass
-// =============================================================================
 
 [[host_name("cce_finalize_loss_with_lse")]]
 [[kernel]] void cce_finalize_loss_with_lse(

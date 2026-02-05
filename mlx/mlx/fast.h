@@ -100,33 +100,12 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     bool ensure_row_contiguous = false,
     StreamOrDevice s = {});
 
-/** Computes Cut Cross-Entropy loss efficiently
- *
- * CCE computes cross-entropy loss without materializing the full logits tensor
- * by tiling over the vocabulary dimension and using online logsumexp.
- *
- * Key features:
- * - Tiles vocabulary (not tokens) for optimal memory efficiency
- * - Uses threadgroup memory for weight tiles
- * - Exploits softmax sparsity in backward pass (~99% compute savings)
- * - Properly computes grad_weight for training
- *
- * Based on Apple's "Cut Your Losses" paper.
- *
- * Args:
- *   hidden: Input hidden states [N, H] or [B, T, H]
- *   weight: Language model head weight [V, H]
- *   targets: Target indices [N] or [B, T]
- *   ignore_index: Target index to ignore in loss computation
- *
- * Returns:
- *   Per-token loss values [N] or [B, T]
- */
 MLX_API array cce_loss(
     const array& hidden,
     const array& weight,
     const array& targets,
     int ignore_index = -100,
+    float logit_softcap = 0.0f,
     StreamOrDevice s = {});
 
 } // namespace mlx::core::fast

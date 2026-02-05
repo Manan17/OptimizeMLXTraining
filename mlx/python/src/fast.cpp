@@ -302,9 +302,10 @@ void init_fast(nb::module_& parent_module) {
       "targets"_a,
       nb::kw_only(),
       "ignore_index"_a = -100,
+      "logit_softcap"_a = 0.0f,
       "stream"_a = nb::none(),
       nb::sig(
-          "def cce_loss(hidden: array, weight: array, targets: array, *, ignore_index: int = -100, stream: Union[None, Stream, Device] = None) -> array"),
+          "def cce_loss(hidden: array, weight: array, targets: array, *, ignore_index: int = -100, logit_softcap: float = 0.0, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         Cut Cross-Entropy (CCE) loss with optimized GPU implementation.
 
@@ -318,6 +319,8 @@ void init_fast(nb::module_& parent_module) {
         The computation is equivalent to::
 
             logits = hidden @ weight.T
+            if logit_softcap > 0:
+                logits = logit_softcap * tanh(logits / logit_softcap)
             loss = cross_entropy(logits, targets, ignore_index=ignore_index)
 
         But uses O(N * vocab_tile_size) memory instead of O(N * V).
@@ -338,6 +341,9 @@ void init_fast(nb::module_& parent_module) {
             ignore_index (int): Target index to ignore in loss computation.
                 Tokens with this target value do not contribute to the loss.
                 Default: ``-100``.
+            logit_softcap (float): If > 0, apply ``softcap * tanh(logits / softcap)``
+                before computing cross entropy. Used by Gemma-2 style models.
+                Default: ``0.0`` (disabled).
 
         Returns:
             array: Per-token loss values with shape matching ``targets``.
@@ -356,6 +362,9 @@ void init_fast(nb::module_& parent_module) {
             # Memory-efficient cross entropy with CCE
             loss = mx.fast.cce_loss(hidden, weight, targets)
             mean_loss = mx.mean(loss)
+
+            # For Gemma-2 style models with logit softcapping
+            loss = mx.fast.cce_loss(hidden, weight, targets, logit_softcap=30.0)
 
             # Backward pass automatically uses sparsity optimization
             grad = mx.grad(lambda h, w: mx.mean(mx.fast.cce_loss(h, w, targets)))(hidden, weight)

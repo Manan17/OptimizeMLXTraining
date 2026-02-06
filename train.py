@@ -3,7 +3,7 @@
 Simple MLX Training Script with CCE (Chunked Cross-Entropy)
 ============================================================
 Usage:
-    pip install mlx mlx-lm datasets
+    pip install mlx-test mlx-lm datasets
     python train.py                     # Full fine-tuning with CCE
     python train.py --lora              # LoRA fine-tuning
     python train.py --no-cce            # Baseline cross-entropy (no CCE)
